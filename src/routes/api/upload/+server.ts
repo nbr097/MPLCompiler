@@ -1,6 +1,9 @@
 import OpenAI from 'openai';
 
-/** ---------- STRICT schema: use rightmost triple only ---------- */
+/** ---------- STRICT schema: use the RIGHTMOST THREE, in THIS order ----------
+ *  Left→Right at the far right of each row:
+ *     1) SOH   2) MPL   3) Capacity (sometimes spelled "Capcity")
+ */
 const jsonSchema = {
   type: 'object',
   properties: {
@@ -12,22 +15,20 @@ const jsonSchema = {
           article: { type: 'string' },
           description: { type: 'string' },
 
-          // RIGHTMOST THREE numeric columns in order (no guessing):
-          rightmost_mpl: { type: 'number' },      // value from the rightmost trio position #1
-          rightmost_capcity: { type: 'number' },  // value from the rightmost trio position #2 (spelled "Capcity" in the report)
-          rightmost_soh: { type: 'number' },      // value from the rightmost trio position #3
+          // RIGHTMOST THREE numeric columns (DO NOT GUESS NAMES; use POSITION ONLY):
+          rightmost_soh: { type: 'number' },       // position #1 (leftmost of the trio)
+          rightmost_mpl: { type: 'number' },       // position #2 (middle)
+          rightmost_capacity: { type: 'number' },  // position #3 (rightmost of the trio)
 
-          // extra context (always present to satisfy validator)
-          om: { type: 'number' },                 // OM near start (NOT used for filter)
-          raw_row: { type: 'string' }             // raw textual row you parsed
+          // context/debug (always present to satisfy validator)
+          raw_row: { type: 'string' }
         },
         required: [
           'article',
           'description',
-          'rightmost_mpl',
-          'rightmost_capcity',
           'rightmost_soh',
-          'om',
+          'rightmost_mpl',
+          'rightmost_capacity',
           'raw_row'
         ],
         additionalProperties: false
@@ -38,35 +39,36 @@ const jsonSchema = {
   additionalProperties: false
 };
 
-/** ---------- Prompts (position-locked) ---------- */
+/** ---------- Prompts (position-locked; SOH, MPL, Capacity) ---------- */
 const systemPrompt = `
-You are a precise retail inventory parser. Do NOT guess. Read table rows and extract by POSITION.
+You are a precise retail inventory parser. Do NOT guess. Extract by POSITION only.
 
-CRITICAL:
-- Every row ends with a block of three numeric columns at the right edge.
-- Those three (in left→right order) are EXACTLY:
-  [ 1st = MPL,  2nd = Capcity (capacity, may be misspelled),  3rd = SOH ].
-- Ignore any other numeric columns (e.g. OM). OM appears near the start and is not part of the rightmost trio.
+CRITICAL SHAPE (per row):
+- The far-right end of each row contains exactly three numeric columns, left→right:
+  [ SOH , MPL , Capacity ]   (Capacity may appear misspelled as "Capcity".)
+- Ignore any other numeric columns such as OM earlier in the row.
 
-For EACH row:
-1) Return the three rightmost numeric values as:
-   rightmost_mpl, rightmost_capcity, rightmost_soh — in that exact order. Never swap or reorder.
-2) Also return:
+FOR EACH ROW:
+1) Read the LAST THREE numeric cells on the right edge.
+2) Assign them IN ORDER to: rightmost_soh, rightmost_mpl, rightmost_capacity.
+   Never reorder or relabel these three; take them strictly by position.
+3) Also return:
    - article (ID) from its column,
-   - description (human-friendly name; strip any supplier prefixes like "PI " at the very start),
-   - om (the OM value near the start; if blank, return 0),
-   - raw_row (the raw text of the line you read).
-3) Integers only for all numbers. If a cell is blank, return 0.
+   - description (clean human name; remove any supplier prefix like "PI " at the very start),
+   - raw_row (verbatim row text you read).
+4) Integers only for numbers. If a cell is blank, return 0.
+
+FILTER:
+- Only include rows in your output where rightmost_soh ≤ rightmost_mpl.
 
 IMPORTANT:
-- Do not rename or map these three; just take them by position.
-- Do not use sums/totals/footers.
-- Only include rows in your output where rightmost_soh ≤ rightmost_mpl.
+- Do NOT use totals/footers.
+- If OCR is noisy, rely on the position rule above; never substitute Capacity for MPL or vice versa.
 `;
 
 const userPrompt = `
 Goal: Return ONLY items where SOH ≤ MPL using the RIGHTMOST-THREE rule above.
-Output must match the JSON schema exactly. Numbers are integers; blanks become 0.
+Output MUST match the JSON schema exactly. Numbers are integers; blanks become 0.
 `;
 
 /** ---------- Helpers ---------- */
@@ -110,7 +112,7 @@ export const POST = async ({ request, platform }) => {
       purpose: 'assistants'
     });
 
-    // 2) Responses API with Structured Outputs (position-locked)
+    // 2) Responses API with Structured Outputs (position-locked to SOH,MPL,Capacity)
     const resp = await openai.responses.create({
       model,
       input: [
@@ -126,7 +128,7 @@ export const POST = async ({ request, platform }) => {
       text: {
         format: {
           type: 'json_schema',
-          name: 'RightmostTripleRows',
+          name: 'RightmostTripleSOH_MPL_Capacity',
           schema: jsonSchema,
           strict: true
         }
@@ -147,20 +149,20 @@ export const POST = async ({ request, platform }) => {
     let data = {};
     try { data = JSON.parse(outStr); } catch { data = { rows: [] }; }
 
-    const finalRows = Array.isArray(data.rows) ? data.rows.map(r => {
-      const mpl = toInt(r.rightmost_mpl);
-      const soh = toInt(r.rightmost_soh);
-
-      return {
-        article: String(r.article ?? '').trim(),
-        description: cleanDescription(r.description),
-        mpl,
-        soh
-      };
-    })
-    // Defensive re-filter in case the model slipped a violating row in:
-    .filter(r => r.article && r.soh <= r.mpl)
-    : [];
+    const finalRows = Array.isArray(data.rows) ? data.rows
+      .map(r => {
+        const soh = toInt(r.rightmost_soh);
+        const mpl = toInt(r.rightmost_mpl);
+        return {
+          article: String(r.article ?? '').trim(),
+          description: cleanDescription(r.description),
+          mpl,
+          soh
+        };
+      })
+      // Defensive re-filter in case any bad row slipped through
+      .filter(r => r.article && r.soh <= r.mpl)
+      : [];
 
     return new Response(JSON.stringify({ rows: finalRows }), {
       headers: { 'content-type': 'application/json' }

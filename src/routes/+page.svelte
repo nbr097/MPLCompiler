@@ -253,10 +253,6 @@
           <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/70 p-6 shadow-sm h-full">
             <h2 class="text-lg font-semibold">Status</h2>
             <div class="mt-4 space-y-3 text-sm">
-              <div class="flex items-center justify-between">
-                <span class="text-slate-500 dark:text-slate-400">Parser URL</span>
-                <span class="truncate max-w-[60%] text-right text-slate-700 dark:text-slate-200">{lastParserURL || '—'}</span>
-              </div>
               {#if meta}
                 <div class="grid grid-cols-2 gap-3">
                   <div class="rounded-xl bg-slate-100 dark:bg-slate-800/70 p-3">

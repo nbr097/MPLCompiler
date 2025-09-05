@@ -31,7 +31,6 @@ For each matched row return: article (ID), description (clean text), mpl (number
 Return JSON matching the provided schema exactly.
 `;
 
-/** @type {import('@sveltejs/kit').RequestHandler} */
 export const POST = async ({ request, platform }) => {
   try {
     const form = await request.formData();
@@ -55,7 +54,7 @@ export const POST = async ({ request, platform }) => {
     }
 
     const model = platform?.env?.OPENAI_MODEL || 'gpt-4o-mini';
-    const baseURL = platform?.env?.OPENAI_BASE_URL; // optional
+    const baseURL = platform?.env?.OPENAI_BASE_URL; // optional override
 
     const openai = new OpenAI({ apiKey, baseURL });
 
@@ -65,10 +64,9 @@ export const POST = async ({ request, platform }) => {
       purpose: 'assistants' // works for Responses API file references
     });
 
-    // 2) Call the Responses API with Structured Outputs (new shape)
+    // 2) Call the Responses API with Structured Outputs (new shape under text.format)
     const resp = await openai.responses.create({
       model,
-      modalities: ['text'],
       input: [
         {
           role: 'user',
@@ -88,11 +86,30 @@ export const POST = async ({ request, platform }) => {
       }
     });
 
-    // 3) Structured outputs return as a JSON string in output_text
-    const out = resp?.output_text ?? JSON.stringify({ rows: [] });
+    // 3) Structured outputs typically return as a JSON string in output_text
+    let out = resp?.output_text;
+
+    // Fallback for SDK shape differences, just in case
+    if (!out) {
+      try {
+        const first = resp?.output?.[0]?.content?.find?.(p => p.type === 'output_text');
+        if (first?.text) out = first.text;
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!out) {
+      out = JSON.stringify({ rows: [] });
+    }
+
     return new Response(out, { headers: { 'content-type': 'application/json' } });
   } catch (e) {
-    const msg = (e && typeof e === 'object' && 'message' in e) ? e.message : String(e);
-    return new Response(msg, { status: 500 });
+    // Try to surface helpful error info
+    const msg =
+      (e && typeof e === 'object' && 'message' in e && e.message) ||
+      (e && typeof e === 'object' && 'toString' in e && e.toString()) ||
+      'Server error';
+    return new Response(String(msg), { status: 500 });
   }
 };

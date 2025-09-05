@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 
-/** ---------- Strict JSON Schema (with a few optional debug fields) ---------- */
+/** ---------- Strict JSON Schema (all keys required) ---------- */
+/* OpenAI Structured Outputs wants all properties listed in `required`. */
 const jsonSchema = {
   type: 'object',
   properties: {
@@ -13,15 +14,23 @@ const jsonSchema = {
           description: { type: 'string' },
           mpl: { type: 'number' },
           soh: { type: 'number' },
-
-          // Optional diagnostics we won't show in the UI but help the model be precise
-          capacity: { type: 'number' },
-          om: { type: 'number' },
-          mpl_header: { type: 'string' },
-          soh_header: { type: 'string' },
-          raw_row: { type: 'string' }
+          capacity: { type: 'number' },     // from "Capcity" column (misspelled in report)
+          om: { type: 'number' },           // from "OM" column
+          mpl_header: { type: 'string' },   // exact header used for mpl
+          soh_header: { type: 'string' },   // exact header used for soh
+          raw_row: { type: 'string' }       // raw text of the parsed row
         },
-        required: ['article', 'description', 'mpl', 'soh'],
+        required: [
+          'article',
+          'description',
+          'mpl',
+          'soh',
+          'capacity',
+          'om',
+          'mpl_header',
+          'soh_header',
+          'raw_row'
+        ],
         additionalProperties: false
       }
     }
@@ -34,29 +43,32 @@ const jsonSchema = {
 const systemPrompt = `
 You are a precise retail inventory parser. Extract data STRICTLY by table column headers.
 
-The report header includes many columns such as:
+Typical header layout includes (order varies):
 "Description  OM  Article  ...  MPL  Capcity  SOH"
+
 Rules:
-- Map fields ONLY by header names (or clear synonyms).
+- Map fields ONLY by header names (or obvious synonyms).
 - MPL column: header exactly "MPL".
 - SOH column: header exactly "SOH".
 - Capacity column may appear as "Capcity" (misspelled). Do NOT treat Capacity as MPL or SOH.
-- OM is near the start of the row and is NOT MPL.
-- Article: 5-8+ digit identifier.
-- Description: human-friendly item name; remove supplier prefixes like "PI ", "WW ", "BW " if present at the start.
-- Use integers for MPL and SOH.
-- IMPORTANT: In each row, the *last three* numeric columns are in the order: MPL, Capcity, SOH. If ambiguous, rely on header names and this right-edge ordering.
-- Never swap MPL with SOH. If uncertain, do not guess; leave a note in raw_row and choose the values as per header positions.
+- OM appears near the start of rows and is NOT MPL or SOH.
+- Article: 5–8+ digit identifier.
+- Description: human-friendly name; remove supplier prefixes like "PI ", "WW ", "BW " if they appear at the very start.
+- IMPORTANT: On each row, the rightmost trio is typically "MPL  Capcity  SOH". Use header names first; if OCR is ambiguous, fall back to this right-edge ordering.
+- Never swap MPL with SOH. If uncertain, reflect what you used in mpl_header/soh_header and include raw_row for traceability.
+- Integers only for mpl, soh, capacity, om (no strings).
 - Only include rows where SOH ≤ MPL.
+- Output all required fields. If a numeric cell is blank, return 0. If a string cell is blank, return "".
 `;
 
 const userPrompt = `
 Task: From this document, return ONLY the items where SOH ≤ MPL.
-Return JSON matching the provided schema. Also include optional fields:
-- capacity (number extracted from "Capcity"),
-- om (number from "OM"),
-- mpl_header and soh_header (exact header text you used),
-- raw_row (the raw text of the row you read).
+Return JSON that matches the provided schema exactly (all fields required).
+Include:
+- capacity (from "Capcity"),
+- om (from "OM"),
+- mpl_header and soh_header (the exact header names you used),
+- raw_row (the raw text of the line you read).
 `;
 
 /** ---------- Helpers ---------- */
@@ -72,10 +84,8 @@ function toInt(n) {
   return Number.isFinite(x) ? x : 0;
 }
 function looksSwapped(mpl, soh, capacity, om) {
-  // Common failure: MPL mistakenly taken from OM or Capacity.
-  // If SOH > MPL by a wide margin AND capacity === mpl, it's likely swapped.
+  // Heuristics to catch MPL/SOH swaps or MPL==Capacity mistakes
   if (capacity != null && mpl === capacity && soh > mpl) return true;
-  // If mpl equals om (and om is in the small floaty range like 3, 9, 22.5) and soh is the largest tail value:
   if (om != null && mpl === om && soh > mpl) return true;
   return false;
 }
@@ -133,7 +143,7 @@ export const POST = async ({ request, platform }) => {
       }
     });
 
-    // 3) Extract JSON
+    // 3) Extract text JSON
     let outStr = resp?.output_text;
     if (!outStr) {
       try {
@@ -143,15 +153,15 @@ export const POST = async ({ request, platform }) => {
     }
     if (!outStr) outStr = JSON.stringify({ rows: [] });
 
-    /** 4) Harden and validate rows server-side */
+    // 4) Harden + validate
     let data = {};
     try { data = JSON.parse(outStr); } catch { data = { rows: [] }; }
 
     const cleaned = Array.isArray(data.rows) ? data.rows.map(r => {
       const mpl = toInt(r.mpl);
       const soh = toInt(r.soh);
-      const capacity = r.capacity != null ? toInt(r.capacity) : null;
-      const om = r.om != null ? toInt(r.om) : null;
+      const capacity = toInt(r.capacity);
+      const om = toInt(r.om);
 
       return {
         article: String(r.article ?? '').trim(),
@@ -166,17 +176,19 @@ export const POST = async ({ request, platform }) => {
       };
     }) : [];
 
-    // Validation: must map from explicit headers, must not look swapped, must satisfy the inequality
-    const finalRows = cleaned.filter(r => {
-      const headerOK =
-        (!r.mpl_header || r.mpl_header === 'MPL') &&
-        (!r.soh_header || r.soh_header === 'SOH');
+    // Must come from correct headers, not look swapped, and satisfy inequality
+    const finalRows = cleaned
+      .filter(r => {
+        const headerOK =
+          (!r.mpl_header || r.mpl_header === 'MPL') &&
+          (!r.soh_header || r.soh_header === 'SOH');
 
-      if (!r.article || r.mpl < 0 || r.soh < 0) return false;
-      if (!headerOK) return false;
-      if (looksSwapped(r.mpl, r.soh, r.capacity, r.om)) return false;
-      return r.soh <= r.mpl;
-    }).map(({ article, description, mpl, soh }) => ({ article, description, mpl, soh }));
+        if (!r.article) return false;
+        if (!headerOK) return false;
+        if (looksSwapped(r.mpl, r.soh, r.capacity, r.om)) return false;
+        return r.soh <= r.mpl;
+      })
+      .map(({ article, description, mpl, soh }) => ({ article, description, mpl, soh }));
 
     return new Response(JSON.stringify({ rows: finalRows }), {
       headers: { 'content-type': 'application/json' }

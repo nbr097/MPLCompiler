@@ -1,6 +1,7 @@
+# wrangler.toml (repo root)
 name = "mplcompiler-pages"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Tell Pages where the build output is (adapter-cloudflare writes here)
+# tell Cloudflare Pages where the adapter-cloudflare build output is
 pages_build_output_dir = ".svelte-kit/cloudflare"

@@ -1,15 +1,24 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
 
-  type Row = { article: string; description: string; mpl: number; soh: number };
+  type Row = { article: string; description: string; soh: number; mpl: number };
+  type Meta = {
+    pages_total: number; pages_scanned: number; rows_returned: number;
+    rows_considered: number; limit_pages: number; mode_used: string[]; scanned_image_pages: number;
+  } | null;
 
   let file: File | null = null;
   let rows: Row[] = [];
+  let meta: Meta = null;
   let loading = false;
   let error = '';
-  let limitPages: number | '' = 0; // 0 = all pages by default
+  let limitPages: number | '' = 0; // 0 = scan all pages
   let lastParserURL = '';
   let lastStatus = 0;
+
+  // drag-anywhere overlay
+  let dragging = false;
+  let dragCounter = 0;
 
   function withTimeout<T>(p: Promise<T>, ms = 90_000) {
     return Promise.race([
@@ -20,13 +29,12 @@
     ]);
   }
 
-  async function submit() {
-    if (!file) { error = 'Choose a file first.'; return; }
-    loading = true; error = ''; rows = []; lastParserURL = ''; lastStatus = 0;
+  async function uploadAndExtract() {
+    if (!file) { error = 'Choose or drop a PDF first.'; return; }
+    loading = true; error = ''; rows = []; meta = null; lastStatus = 0; lastParserURL = '';
 
     const fd = new FormData();
     fd.append('file', file);
-    // Always send limit_pages; 0 means "all pages"
     const lp = (limitPages === '' ? 0 : Number(limitPages));
     fd.append('limit_pages', String(isFinite(lp) ? lp : 0));
 
@@ -36,11 +44,12 @@
       lastStatus = r.status;
       const txt = await r.text();
       if (!r.ok) {
-        error = (txt || 'Request failed');
+        error = txt || `HTTP ${r.status}`;
         return;
       }
       const data = JSON.parse(txt || '{}');
       rows = Array.isArray(data.rows) ? data.rows : [];
+      meta = data.meta || null;
     } catch (e: any) {
       error = e?.message ?? 'Network error';
     } finally {
@@ -49,89 +58,195 @@
   }
 
   function copyTSV() {
-    const header = 'Article\tDescription\tMPL\tSOH';
-    const body = rows.map(r => `${r.article}\t${r.description}\t${r.mpl}\t${r.soh}`).join('\n');
+    const header = 'Article\tDescription\tSOH\tMPL';
+    const body = rows.map(r => `${r.article}\t${r.description}\t${r.soh}\t${r.mpl}`).join('\n');
     navigator.clipboard.writeText([header, body].join('\n'));
-    alert('Copied as TSV for Google Sheets');
   }
 
   function downloadCSV() {
-    const header = 'Article,Description,MPL,SOH';
+    const header = 'Article,Description,SOH,MPL';
     const esc = (s: string) => `"${(s || '').replace(/"/g, '""')}"`;
-    const body = rows.map(r => [r.article, r.description, r.mpl, r.soh].map(v => esc(String(v))).join(',')).join('\n');
+    const body = rows.map(r => [r.article, r.description, r.soh, r.mpl].map(v => esc(String(v))).join(',')).join('\n');
     const blob = new Blob([header + '\n' + body], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = 'soh_le_mpl.csv'; a.click();
     URL.revokeObjectURL(url);
   }
+
+  function onFileInput(e: Event) {
+    const target = e.currentTarget as HTMLInputElement;
+    file = target.files?.[0] ?? null;
+  }
+
+  // Drag-anywhere events (window-level)
+  function onDragOver(e: DragEvent) {
+    e.preventDefault();
+    e.dataTransfer!.dropEffect = 'copy';
+  }
+  function onDragEnter(e: DragEvent) {
+    e.preventDefault();
+    dragCounter += 1;
+    dragging = true;
+  }
+  function onDragLeave(e: DragEvent) {
+    e.preventDefault();
+    dragCounter -= 1;
+    if (dragCounter <= 0) { dragging = false; dragCounter = 0; }
+  }
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dragging = false; dragCounter = 0;
+    const f = e.dataTransfer?.files?.[0];
+    if (f) {
+      file = f;
+      // auto-start
+      uploadAndExtract();
+    }
+  }
+
+  onMount(() => {
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragenter', onDragEnter);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+  });
+  onDestroy(() => {
+    window.removeEventListener('dragover', onDragOver);
+    window.removeEventListener('dragenter', onDragEnter);
+    window.removeEventListener('dragleave', onDragLeave);
+    window.removeEventListener('drop', onDrop);
+  });
 </script>
 
-<div style="max-width: 900px; margin: 2rem auto; padding: 1rem;">
-  <h1 style="font-size:1.6rem; margin:0 0 0.5rem 0;">Inventory PDF → Filtered Table</h1>
-  <p style="margin:0 0 1rem 0; color:#444;">
-    Upload a PDF and get only the rows where <strong>SOH ≤ MPL</strong>.
-  </p>
+<!-- Page shell -->
+<div class="min-h-screen bg-gradient-to-b from-slate-50 to-white text-slate-800">
 
-  <label style="display:block; margin: 0 0 0.5rem 0;">
-    Pages to scan (0 = all):
-    <input type="number" min="0" step="1" bind:value={limitPages} style="max-width: 120px;" />
-  </label>
-
-  <input type="file" accept=".pdf" on:change={(e:any)=>{file=e.currentTarget.files?.[0]??null;}} />
-
-  <div style="margin-top:0.75rem;">
-    <button on:click={submit} disabled={loading} style="padding:0.5rem 0.8rem;">
-      {loading ? 'Processing…' : 'Upload & Extract'}
-    </button>
-    {#if loading}
-      <span style="margin-left: 8px; color:#666;">Parsing…</span>
-    {/if}
-  </div>
-
-  {#if error}
-    <div style="margin-top:0.75rem; padding:0.5rem; border:1px solid #f3b; background:#fff0f6;">
-      <div style="font-weight:600; color:#b00; margin-bottom:4px;">Error</div>
-      <pre style="white-space:pre-wrap; margin:0;">{error}</pre>
-      {#if lastParserURL}
-        <div style="color:#555; margin-top:6px; font-size:0.9rem;">Parser call: {lastParserURL}</div>
-      {/if}
-    </div>
-  {/if}
-
-  {#if !loading && !error && rows.length === 0}
-    <div style="margin-top:0.75rem; padding:0.5rem; border:1px solid #ddd; background:#fafafa;">
-      <strong>No rows matched (SOH ≤ MPL).</strong>
-      <div style="color:#444; margin-top:4px;">
-        Try increasing <em>Pages to scan</em> (set it to 0 to scan the whole PDF),
-        or check that the PDF has rows where SOH is less than or equal to MPL on the scanned pages.
+  <!-- Drag overlay -->
+  {#if dragging}
+    <div class="fixed inset-0 z-40 bg-black/30 backdrop-blur-sm flex items-center justify-center">
+      <div class="mx-6 rounded-2xl border-2 border-dashed border-white/70 bg-white/90 p-10 text-center shadow-xl">
+        <div class="text-2xl font-semibold mb-2">Drop your PDF to upload</div>
+        <div class="text-slate-600">We’ll scan it and list rows where <span class="font-semibold">SOH ≤ MPL</span>.</div>
       </div>
     </div>
   {/if}
 
-  {#if rows.length}
-    <div style="display:flex; align-items:center; gap:0.75rem; margin-top:1rem;">
-      <button on:click={copyTSV}>Copy TSV</button>
-      <button on:click={downloadCSV}>Download CSV</button>
-      <span style="color:#555;">{rows.length} row{rows.length === 1 ? '' : 's'}</span>
-    </div>
+  <header class="mx-auto max-w-5xl px-6 pt-10 pb-4">
+    <h1 class="text-3xl font-bold tracking-tight">Inventory PDF → <span class="text-sky-600">Filtered Table</span></h1>
+    <p class="mt-2 text-slate-600">Upload or drop a PDF and we’ll return only the rows where <span class="font-semibold">SOH ≤ MPL</span>.</p>
+  </header>
 
-    <div style="overflow:auto; margin-top:0.75rem;">
-      <table border="1" cellpadding="6" style="border-collapse:collapse; min-width:700px;">
-        <thead style="background:#f3f3f3;">
-          <tr><th>Article</th><th>Description</th><th>SOH</th><th>MPL</th></tr>
-        </thead>
-        <tbody>
-          {#each rows as r}
-            <tr>
-              <td>{r.article}</td>
-              <td>{r.description}</td>
-              <td>{r.soh}</td>
-              <td>{r.mpl}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
+  <main class="mx-auto max-w-5xl px-6 pb-16">
+    <!-- Card -->
+    <div class="rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <div class="p-6 space-y-6">
+
+        <!-- Drop zone / chooser -->
+        <div class="flex flex-col md:flex-row md:items-end gap-4">
+          <div class="flex-1">
+            <label class="block text-sm font-medium text-slate-700 mb-2">File</label>
+            <label class="group relative flex w-full cursor-pointer items-center justify-between gap-4 rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 px-4 py-6 hover:border-sky-400 hover:bg-sky-50">
+              <div class="flex items-center gap-3">
+                <div class="rounded-lg bg-white p-2 shadow-sm ring-1 ring-slate-200">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-sky-600" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 13h6m-6 4h6M3 7h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+                </div>
+                <div>
+                  <div class="text-slate-900 font-medium">Click to choose a PDF</div>
+                  <div class="text-slate-500 text-sm">…or drop it anywhere on this page</div>
+                </div>
+              </div>
+              <div class="text-xs text-slate-500">{file ? file.name : 'No file selected'}</div>
+              <input class="absolute inset-0 opacity-0 cursor-pointer" type="file" accept=".pdf" on:change={onFileInput} />
+            </label>
+          </div>
+
+          <div class="w-full md:w-44">
+            <label class="block text-sm font-medium text-slate-700 mb-2">Pages to scan</label>
+            <input type="number" min="0" step="1" bind:value={limitPages}
+              class="block w-full rounded-lg border-slate-300 focus:border-sky-500 focus:ring-sky-500"
+              placeholder="0 = all" />
+          </div>
+
+          <div class="w-full md:w-auto">
+            <button
+              on:click={uploadAndExtract}
+              class="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-sky-600 px-4 py-3 text-white shadow hover:bg-sky-700 disabled:opacity-60 disabled:cursor-not-allowed"
+              disabled={loading || !file}>
+              {#if loading}
+                <svg class="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/></svg>
+                Processing…
+              {:else}
+                Upload & Extract
+              {/if}
+            </button>
+          </div>
+        </div>
+
+        <!-- Error -->
+        {#if error}
+          <div class="rounded-lg border border-rose-200 bg-rose-50 p-4 text-rose-800">
+            <div class="font-semibold">Error</div>
+            <pre class="mt-1 whitespace-pre-wrap text-sm">{error}</pre>
+            {#if lastParserURL}
+              <div class="mt-2 text-xs text-rose-700/80">Parser call: {lastParserURL}</div>
+            {/if}
+          </div>
+        {/if}
+
+        <!-- Empty state -->
+        {#if !loading && !error && rows.length === 0}
+          <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 text-slate-700">
+            <div class="font-medium">No rows matched (SOH ≤ MPL).</div>
+            <div class="text-sm text-slate-600 mt-1">Try scanning more pages (set to <span class="font-semibold">0</span> to scan the whole PDF).</div>
+          </div>
+        {/if}
+
+        <!-- Actions + meta -->
+        {#if rows.length}
+          <div class="flex flex-wrap items-center gap-3">
+            <button on:click={copyTSV} class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-700 hover:bg-slate-50">Copy TSV</button>
+            <button on:click={downloadCSV} class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-700 hover:bg-slate-50">Download CSV</button>
+            <span class="text-sm text-slate-600">{rows.length} row{rows.length === 1 ? '' : 's'}</span>
+            {#if meta}
+              <span class="text-xs text-slate-500">• pages scanned: {meta.pages_scanned}/{meta.pages_total}</span>
+              <span class="text-xs text-slate-500">• parser mode: {meta.mode_used?.join(', ')}</span>
+            {/if}
+          </div>
+
+          <!-- Table -->
+          <div class="overflow-auto rounded-xl border border-slate-200">
+            <table class="min-w-[720px] w-full text-left">
+              <thead class="bg-slate-100 text-slate-700 sticky top-0">
+                <tr>
+                  <th class="px-4 py-2 text-sm font-semibold">Article</th>
+                  <th class="px-4 py-2 text-sm font-semibold">Description</th>
+                  <th class="px-4 py-2 text-sm font-semibold">SOH</th>
+                  <th class="px-4 py-2 text-sm font-semibold">MPL</th>
+                </tr>
+              </thead>
+              <tbody class="[&>tr:nth-child(odd)]:bg-white [&>tr:nth-child(even)]:bg-slate-50">
+                {#each rows as r}
+                  <tr class="border-t border-slate-200">
+                    <td class="px-4 py-2 font-medium tabular-nums">{r.article}</td>
+                    <td class="px-4 py-2">{r.description}</td>
+                    <td class="px-4 py-2 tabular-nums">{r.soh}</td>
+                    <td class="px-4 py-2 tabular-nums">{r.mpl}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </div>
+
+      <!-- footer info -->
+      <div class="flex items-center justify-between border-t border-slate-200 px-6 py-4 text-xs text-slate-500">
+        <div>Only rows with <span class="font-semibold">SOH ≤ MPL</span> are returned.</div>
+        {#if lastStatus}
+          <div>HTTP {lastStatus}</div>
+        {/if}
+      </div>
     </div>
-  {/if}
+  </main>
 </div>

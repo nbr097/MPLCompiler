@@ -119,7 +119,7 @@
     <div style="overflow:auto; margin-top:0.75rem;">
       <table border="1" cellpadding="6" style="border-collapse:collapse; min-width:700px;">
         <thead style="background:#f3f3f3;">
-          <tr><th>Article</th><th>Description</th><th>MPL</th><th>SOH</th></tr>
+          <tr><th>Article</th><th>Description</th><th>SOH</th><th>MPL</th></tr>
         </thead>
         <tbody>
           {#each rows as r}

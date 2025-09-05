@@ -105,11 +105,11 @@ export const POST = async ({ request, platform }) => {
 
     return new Response(out, { headers: { 'content-type': 'application/json' } });
   } catch (e) {
-    // Try to surface helpful error info
-    const msg =
-      (e && typeof e === 'object' && 'message' in e && e.message) ||
-      (e && typeof e === 'object' && 'toString' in e && e.toString()) ||
-      'Server error';
-    return new Response(String(msg), { status: 500 });
+  // OpenAI often returns a JSON body with helpful info
+  try {
+    const detail = e?.response ? await e.response.text() : e?.message || String(e);
+    return new Response(detail, { status: e?.status || 500, headers: { 'content-type': 'application/json' } });
+  } catch {
+    return new Response(e?.message ?? 'Server error', { status: 500 });
   }
 };

@@ -1,32 +1,28 @@
 import OpenAI from 'openai';
 import type { RequestHandler } from './$types';
 
-// Strict JSON schema for Structured Outputs (OpenAI)
-const schema = {
-  name: 'InventoryRows',
-  schema: {
-    type: 'object',
-    properties: {
-      rows: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            article: { type: 'string' },
-            description: { type: 'string' },
-            mpl: { type: 'number' },
-            soh: { type: 'number' }
-          },
-          required: ['article', 'description', 'mpl', 'soh'],
-          additionalProperties: false
-        }
+// Pure JSON Schema (no "name" here)
+const jsonSchema = {
+  type: 'object',
+  properties: {
+    rows: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          article: { type: 'string' },
+          description: { type: 'string' },
+          mpl: { type: 'number' },
+          soh: { type: 'number' }
+        },
+        required: ['article', 'description', 'mpl', 'soh'],
+        additionalProperties: false
       }
-    },
-    required: ['rows'],
-    additionalProperties: false
+    }
   },
-  strict: true
-};
+  required: ['rows'],
+  additionalProperties: false
+} as const;
 
 const baseInstructions =
   `You are a retail inventory parser. Given an inventory document (may be a PDF with tables),
@@ -54,9 +50,9 @@ export const POST: RequestHandler = async ({ request, platform }) => {
     const model = platform?.env?.OPENAI_MODEL || 'gpt-4o-mini';
     const openai = new OpenAI({ apiKey, baseURL: platform?.env?.OPENAI_BASE_URL });
 
-    // Upload file then reference it in the Responses API call
+    // Upload file, then reference by id
     const uploaded = await openai.files.create({
-      file, // File from FormData (Workers-compatible)
+      file,                // File from FormData (Workers-compatible)
       purpose: 'assistants'
     });
 
@@ -71,16 +67,19 @@ export const POST: RequestHandler = async ({ request, platform }) => {
           ]
         }
       ],
-      // ⬇⬇⬇ NEW: use text.format instead of response_format
+      // ✅ Responses API requires a name under text.format
       text: {
         format: {
           type: 'json_schema',
-          json_schema: schema
+          name: 'InventoryRows',           // <— add this
+          json_schema: {
+            schema: jsonSchema,
+            strict: true
+          }
         }
       }
     });
 
-    // Straight JSON string in output_text when using structured outputs
     const out = (resp as any).output_text ?? JSON.stringify({ rows: [] });
     return new Response(out, { headers: { 'content-type': 'application/json' } });
 

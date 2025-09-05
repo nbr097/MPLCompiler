@@ -210,7 +210,9 @@
             <span class="text-sm text-slate-600">{rows.length} row{rows.length === 1 ? '' : 's'}</span>
             {#if meta}
               <span class="text-xs text-slate-500">• pages scanned: {meta.pages_scanned}/{meta.pages_total}</span>
+ <!-- Parser Mode Block 
               <span class="text-xs text-slate-500">• parser mode: {meta.mode_used?.join(', ')}</span>
+-->
             {/if}
           </div>
 

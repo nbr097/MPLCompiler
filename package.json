@@ -1,0 +1,20 @@
+{
+  "name": "inventory-parser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@sveltejs/kit": "latest",
+    "openai": "^4.57.0",
+    "svelte": "latest"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-cloudflare": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  }
+}

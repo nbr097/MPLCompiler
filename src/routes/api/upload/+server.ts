@@ -41,10 +41,6 @@ export const POST: RequestHandler = async ({ request, platform }) => {
     const file = form.get('file') as File | null;
 
     if (!file) return new Response('No file', { status: 400 });
-
-    // Gemini note: Uploading large PDFs to Gemini's File API from Cloudflare Workers
-    // is doable via REST, but the official FileManager helper is not Worker-friendly.
-    // We'll keep OpenAI as the default/ready path here.
     if (provider !== 'openai') {
       return new Response(
         JSON.stringify({ error: 'Gemini path is not enabled on Cloudflare in this starter. Use OpenAI for now.' }),
@@ -56,13 +52,11 @@ export const POST: RequestHandler = async ({ request, platform }) => {
     if (!apiKey) return new Response('Missing OPENAI_API_KEY', { status: 500 });
 
     const model = platform?.env?.OPENAI_MODEL || 'gpt-4o-mini';
-
-    // OpenAI SDK v4 supports Cloudflare Workers/edge runtimes
     const openai = new OpenAI({ apiKey, baseURL: platform?.env?.OPENAI_BASE_URL });
 
-    // Upload the file to OpenAI, then reference by file_id in a Responses request
+    // Upload file then reference it in the Responses API call
     const uploaded = await openai.files.create({
-      file, // File object from the FormData (works on Workers)
+      file, // File from FormData (Workers-compatible)
       purpose: 'assistants'
     });
 
@@ -77,9 +71,16 @@ export const POST: RequestHandler = async ({ request, platform }) => {
           ]
         }
       ],
-      response_format: { type: 'json_schema', json_schema: schema }
+      // ⬇⬇⬇ NEW: use text.format instead of response_format
+      text: {
+        format: {
+          type: 'json_schema',
+          json_schema: schema
+        }
+      }
     });
 
+    // Straight JSON string in output_text when using structured outputs
     const out = (resp as any).output_text ?? JSON.stringify({ rows: [] });
     return new Response(out, { headers: { 'content-type': 'application/json' } });
 

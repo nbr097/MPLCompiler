@@ -1,9 +1,26 @@
 <script lang="ts">
-  let provider: 'openai' | 'gemini' = 'openai'; // OpenAI is fully wired; Gemini optional later
+  import { onMount } from 'svelte';
+
+  let provider: 'openai' | 'gemini' = 'openai';
   let file: File | null = null;
+  let rows: { article: string; description: string; mpl: number; soh: number }[] = [];
   let loading = false;
   let error = '';
-  let rows: { article: string; description: string; mpl: number; soh: number }[] = [];
+  let model = 'loading…';
+
+  onMount(async () => {
+    try {
+      const r = await fetch('/api/model');
+      if (r.ok) {
+        const d = await r.json();
+        model = d.model || 'unknown';
+      } else {
+        model = 'unknown';
+      }
+    } catch {
+      model = 'unknown';
+    }
+  });
 
   async function submit() {
     if (!file) { error = 'Choose a file first.'; return; }
@@ -12,15 +29,23 @@
     fd.append('file', file);
     fd.append('provider', provider);
 
-    const r = await fetch('/api/upload', { method: 'POST', body: fd });
-    if (!r.ok) {
-      error = (await r.text()) || 'Request failed';
-    } else {
-      const data = await r.json();
-      rows = data.rows || [];
-      if (!Array.isArray(rows)) rows = [];
+    try {
+      const r = await fetch('/api/upload', { method: 'POST', body: fd });
+      const txt = await r.text();
+      if (!r.ok) {
+        error = txt || 'Request failed';
+        loading = false;
+        return;
+      }
+      const data = JSON.parse(txt || '{}');
+      rows = Array.isArray(data.rows) ? data.rows : [];
+      // if the server echoed the model, update the badge (useful if you change it between deploys)
+      if (data.model) model = data.model;
+    } catch (e: any) {
+      error = e?.message ?? 'Network error';
+    } finally {
+      loading = false;
     }
-    loading = false;
   }
 
   function copyTSV() {
@@ -42,17 +67,25 @@
   }
 </script>
 
-<div style="max-width: 800px; margin: 2rem auto; padding: 1rem;">
-  <h1 style="font-size:1.6rem; margin-bottom: 0.5rem;">Inventory PDF → Filtered Table</h1>
+<div style="max-width: 900px; margin: 2rem auto; padding: 1rem;">
+  <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem; margin-bottom: 0.5rem;">
+    <h1 style="font-size:1.6rem; margin:0;">Inventory PDF → Filtered Table</h1>
+    <span
+      title="Model used by server"
+      style="font: 500 0.9rem/1.2 system-ui, sans-serif; padding: 6px 10px; border-radius: 999px; border: 1px solid #ddd;">
+      Model: <strong>{model}</strong>
+    </span>
+  </div>
+
   <p style="margin:0 0 1rem 0; color:#444;">
-    Upload a PDF/CSV/XLSX inventory report and get only the rows where <strong>SOH ≤ MPL</strong>.
+    Upload a PDF/CSV/XLSX and get only the rows where <strong>SOH ≤ MPL</strong>.
   </p>
 
   <label style="display:block; margin: 0 0 0.5rem 0;">
     Provider:
     <select bind:value={provider}>
-      <option value="openai">OpenAI (recommended)</option>
-      <option value="gemini">Google Gemini (add later)</option>
+      <option value="openai">OpenAI</option>
+      <option value="gemini">Google Gemini (disabled)</option>
     </select>
   </label>
 
@@ -65,7 +98,7 @@
   </div>
 
   {#if error}
-    <p style="color:crimson; margin-top:0.75rem;">{error}</p>
+    <p style="color:crimson; margin-top:0.75rem; white-space: pre-wrap;">{error}</p>
   {/if}
 
   {#if rows.length}

@@ -3,33 +3,15 @@
 
   type Row = { article: string; description: string; mpl: number; soh: number };
 
-  let provider: 'openai' | 'gemini' = 'openai';
   let file: File | null = null;
   let rows: Row[] = [];
   let loading = false;
   let error = '';
-  let model = 'loading…';
-  let limitPages: number | '' = 3; // first N pages ('' = no cap)
+  let limitPages: number | '' = 0; // 0 = all pages by default
+  let lastParserURL = '';
+  let lastStatus = 0;
 
-  async function fetchModel(p = provider) {
-    model = 'checking…';
-    try {
-      const r = await fetch(`/api/model?provider=${encodeURIComponent(p)}`, { cache: 'no-store' });
-      if (r.ok) {
-        const d = await r.json();
-        model = d.model || 'unknown';
-      } else {
-        model = 'unknown';
-      }
-    } catch {
-      model = 'unknown';
-    }
-  }
-
-  onMount(fetchModel);
-  $: fetchModel(provider); // update badge whenever selector changes
-
-  function withTimeout<T>(p: Promise<T>, ms = 130_000) {
+  function withTimeout<T>(p: Promise<T>, ms = 90_000) {
     return Promise.race([
       p,
       new Promise<never>((_, reject) =>
@@ -40,25 +22,25 @@
 
   async function submit() {
     if (!file) { error = 'Choose a file first.'; return; }
-    loading = true; error = ''; rows = [];
+    loading = true; error = ''; rows = []; lastParserURL = ''; lastStatus = 0;
 
     const fd = new FormData();
     fd.append('file', file);
-    fd.append('provider', provider);
-    if (limitPages !== '' && isFinite(+limitPages) && +limitPages > 0) {
-      fd.append('limit_pages', String(+limitPages));
-    }
+    // Always send limit_pages; 0 means "all pages"
+    const lp = (limitPages === '' ? 0 : Number(limitPages));
+    fd.append('limit_pages', String(isFinite(lp) ? lp : 0));
 
     try {
-      const r = await withTimeout(fetch('/api/upload', { method: 'POST', body: fd }), 130_000);
+      const r = await withTimeout(fetch('/api/upload', { method: 'POST', body: fd }), 90_000);
+      lastParserURL = r.headers.get('x-parser-url') || '';
+      lastStatus = r.status;
       const txt = await r.text();
       if (!r.ok) {
-        error = txt || 'Request failed';
+        error = (txt || 'Request failed');
         return;
       }
       const data = JSON.parse(txt || '{}');
       rows = Array.isArray(data.rows) ? data.rows : [];
-      if (data.model) model = data.model; // refresh badge from server response
     } catch (e: any) {
       error = e?.message ?? 'Network error';
     } finally {
@@ -86,45 +68,45 @@
 </script>
 
 <div style="max-width: 900px; margin: 2rem auto; padding: 1rem;">
-  <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem; margin-bottom: 0.5rem;">
-    <h1 style="font-size:1.6rem; margin:0;">Inventory PDF → Filtered Table</h1>
-    <span title="Model used by server"
-      style="font: 500 0.9rem/1.2 system-ui, sans-serif; padding: 6px 10px; border-radius: 999px; border: 1px solid #ddd;">
-      Model: <strong>{model}</strong> &nbsp;<small>({provider})</small>
-    </span>
-  </div>
-
+  <h1 style="font-size:1.6rem; margin:0 0 0.5rem 0;">Inventory PDF → Filtered Table</h1>
   <p style="margin:0 0 1rem 0; color:#444;">
-    Upload a PDF/CSV/XLSX and get only the rows where <strong>SOH ≤ MPL</strong>.
+    Upload a PDF and get only the rows where <strong>SOH ≤ MPL</strong>.
   </p>
 
   <label style="display:block; margin: 0 0 0.5rem 0;">
-    Provider:
-    <select bind:value={provider}>
-      <option value="openai">OpenAI</option>
-      <option value="gemini">Google Gemini</option>
-    </select>
+    Pages to scan (0 = all):
+    <input type="number" min="0" step="1" bind:value={limitPages} style="max-width: 120px;" />
   </label>
 
-  <label style="display:block; margin: 0 0 0.5rem 0;">
-    Pages to scan (optional):
-    <input type="number" min="1" step="1" bind:value={limitPages} placeholder="e.g. 3" style="max-width: 100px;" />
-    <small style="color:#666; margin-left:8px;">Keeps runs fast on big PDFs</small>
-  </label>
-
-  <input type="file" accept=".pdf,.csv,.xlsx" on:change={(e:any)=>{file=e.currentTarget.files?.[0]??null;}} />
+  <input type="file" accept=".pdf" on:change={(e:any)=>{file=e.currentTarget.files?.[0]??null;}} />
 
   <div style="margin-top:0.75rem;">
     <button on:click={submit} disabled={loading} style="padding:0.5rem 0.8rem;">
       {loading ? 'Processing…' : 'Upload & Extract'}
     </button>
     {#if loading}
-      <span style="margin-left: 8px; color:#666;">Large PDFs may take a bit.</span>
+      <span style="margin-left: 8px; color:#666;">Parsing…</span>
     {/if}
   </div>
 
   {#if error}
-    <p style="color:crimson; margin-top:0.75rem; white-space: pre-wrap;">{error}</p>
+    <div style="margin-top:0.75rem; padding:0.5rem; border:1px solid #f3b; background:#fff0f6;">
+      <div style="font-weight:600; color:#b00; margin-bottom:4px;">Error</div>
+      <pre style="white-space:pre-wrap; margin:0;">{error}</pre>
+      {#if lastParserURL}
+        <div style="color:#555; margin-top:6px; font-size:0.9rem;">Parser call: {lastParserURL}</div>
+      {/if}
+    </div>
+  {/if}
+
+  {#if !loading && !error && rows.length === 0}
+    <div style="margin-top:0.75rem; padding:0.5rem; border:1px solid #ddd; background:#fafafa;">
+      <strong>No rows matched (SOH ≤ MPL).</strong>
+      <div style="color:#444; margin-top:4px;">
+        Try increasing <em>Pages to scan</em> (set it to 0 to scan the whole PDF),
+        or check that the PDF has rows where SOH is less than or equal to MPL on the scanned pages.
+      </div>
+    </div>
   {/if}
 
   {#if rows.length}

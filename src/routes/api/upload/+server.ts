@@ -1,9 +1,8 @@
 import OpenAI from 'openai';
 
 /**
- * Structured output schema.
- * We collect header-anchored values (mpl, soh, + headers), the rightmost trio
- * as a second source of truth, and a raw_row string for diagnostics.
+ * Schema: header-anchored values (mpl/soh + headers), the rightmost trio for validation,
+ * and raw_row for diagnostics. We still only RETURN article, description, mpl, soh to the UI.
  */
 const jsonSchema = {
   type: 'object',
@@ -22,7 +21,7 @@ const jsonSchema = {
           mpl_header: { type: 'string' },
           soh_header: { type: 'string' },
 
-          // Rightmost trio (secondary)
+          // Rightmost trio (secondary for validation)
           tail_soh: { type: 'number' },
           tail_mpl: { type: 'number' },
           tail_capacity: { type: 'number' },
@@ -50,7 +49,7 @@ const jsonSchema = {
   additionalProperties: false
 };
 
-const systemPrompt = `
+const baseSystem = `
 You are a precise inventory table parser. Do NOT guess; follow these rules exactly.
 
 Headers & mapping (PRIMARY SOURCE):
@@ -60,7 +59,7 @@ Headers & mapping (PRIMARY SOURCE):
 
 Right-edge trio (SECONDARY SOURCE for validation only):
 - At the far right of each row there are three numeric cells in left→right order:
-  [ SOH , MPL , Capacity ] (Capacity may appear as "Capcity").
+  [ SOH , MPL , Capacity ]  (Capacity may appear as "Capcity").
 - Extract those into tail_soh, tail_mpl, tail_capacity.
 
 For each row output:
@@ -73,7 +72,7 @@ For each row output:
 Integers only; blank numeric cells become 0. No totals/footers/headers.
 `;
 
-const userPrompt = `
+const baseUser = `
 Task: Extract rows per the rules. Return JSON matching the schema exactly.
 `;
 
@@ -91,7 +90,7 @@ function toInt(n) {
   return Number.isFinite(x) ? x : 0;
 }
 
-/** Choose final MPL/SOH using header source unless it looks swapped, else rightmost trio */
+/** Choose final MPL/SOH. Prefer header-anchored if headers look correct; else use rightmost trio. */
 function chooseFinalPair(row) {
   const mh = (row.mpl_header || '').toString().trim().toUpperCase();
   const sh = (row.soh_header || '').toString().trim().toUpperCase();
@@ -117,13 +116,14 @@ function chooseFinalPair(row) {
 /* ---------------- Endpoint ---------------- */
 
 export const POST = async ({ request, platform }) => {
-  // never cache API responses
   const noStore = { 'cache-control': 'no-store', 'content-type': 'application/json' };
 
   try {
     const form = await request.formData();
     const provider = (form.get('provider') || 'openai').toString();
     const file = form.get('file');
+    // optional UI control: limit how many pages to scan
+    const limitPages = Number(form.get('limit_pages') || 3); // default 3 pages for speed
 
     if (!file) return new Response('No file', { status: 400, headers: noStore });
     if (provider !== 'openai') {
@@ -135,36 +135,46 @@ export const POST = async ({ request, platform }) => {
     const apiKey = platform?.env?.OPENAI_API_KEY;
     if (!apiKey) return new Response('Missing OPENAI_API_KEY', { status: 500, headers: noStore });
 
-    // Guard: reject very large PDFs up front (helps avoid long hangs)
-    const MAX_BYTES = 15 * 1024 * 1024; // 15 MB
+    // Speed model recommended: gpt-5-mini; fall back to gpt-5 if not set
+    const model = platform?.env?.OPENAI_MODEL || 'gpt-5-mini';
+    const baseURL = platform?.env?.OPENAI_BASE_URL;
+
+    // Raise/centralize timeouts from env (ms). Example: 90000
+    const REQUEST_TIMEOUT_MS = Number(platform?.env?.OPENAI_REQUEST_TIMEOUT_MS) || 120_000;
+
+    // Guard: reject very large PDFs up front
+    const MAX_BYTES = Number(platform?.env?.MAX_UPLOAD_BYTES) || 10 * 1024 * 1024; // 10 MB
     if (typeof file.size === 'number' && file.size > MAX_BYTES) {
       return new Response(JSON.stringify({ error: `File too large (${file.size} bytes). Limit is ${MAX_BYTES} bytes.` }), {
         status: 413, headers: noStore
       });
     }
 
-    // Show the model back to the UI
-    const model = platform?.env?.OPENAI_MODEL || 'gpt-5';
-    const baseURL = platform?.env?.OPENAI_BASE_URL;
-
-    // Add timeouts & minimal retries so we fail fast instead of hanging
     const openai = new OpenAI({
       apiKey,
       baseURL,
-      timeout: 60_000,  // 60s hard timeout per request to the API
+      timeout: REQUEST_TIMEOUT_MS,
       maxRetries: 0
     });
+
+    // Build the prompts with an explicit page cap (lets the model ignore the rest quickly)
+    const pageNote = limitPages > 0
+      ? `IMPORTANT: Only read the FIRST ${limitPages} pages of the document and ignore all later pages.`
+      : '';
+
+    const systemPrompt = baseSystem + '\n' + pageNote;
+    const userPrompt = baseUser + '\n' + pageNote;
 
     let uploaded = null;
 
     try {
-      // 1) Upload file → file_id (with its own timeout guard)
+      // 1) Upload file → file_id
       uploaded = await openai.files.create({
         file,
         purpose: 'assistants'
       });
 
-      // 2) Responses API + Structured Outputs
+      // 2) Responses API + Structured Outputs (no temperature/max tokens to avoid model rejects)
       const resp = await openai.responses.create({
         model,
         input: [
@@ -216,17 +226,16 @@ export const POST = async ({ request, platform }) => {
       return new Response(JSON.stringify({ model, rows: finalRows }), { headers: noStore });
 
     } finally {
-      // Always try to delete the uploaded file on OpenAI to avoid buildup
+      // Clean up uploaded file regardless of success/failure
       if (uploaded?.id) {
         try { await openai.files.del(uploaded.id); } catch { /* ignore cleanup errors */ }
       }
     }
 
   } catch (e) {
-    // Convert OpenAI/Network timeouts into readable errors
     const status =
       (e && typeof e === 'object' && 'status' in e && e.status) ? e.status :
-      (String(e).includes('timeout') ? 504 : 500);
+      (String(e).toLowerCase().includes('timeout') ? 504 : 500);
 
     const body = (() => {
       try {

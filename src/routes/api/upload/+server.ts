@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 
-// ----- Strict JSON Schema for model output -----
+/** ---------- Strict JSON Schema (with a few optional debug fields) ---------- */
 const jsonSchema = {
   type: 'object',
   properties: {
@@ -12,7 +12,14 @@ const jsonSchema = {
           article: { type: 'string' },
           description: { type: 'string' },
           mpl: { type: 'number' },
-          soh: { type: 'number' }
+          soh: { type: 'number' },
+
+          // Optional diagnostics we won't show in the UI but help the model be precise
+          capacity: { type: 'number' },
+          om: { type: 'number' },
+          mpl_header: { type: 'string' },
+          soh_header: { type: 'string' },
+          raw_row: { type: 'string' }
         },
         required: ['article', 'description', 'mpl', 'soh'],
         additionalProperties: false
@@ -23,36 +30,40 @@ const jsonSchema = {
   additionalProperties: false
 };
 
-// ----- System + user guidance: header-anchored parsing -----
+/** ---------- Prompts (header-anchored rules) ---------- */
 const systemPrompt = `
-You are a precise retail inventory parser. You must extract data strictly by table column headers and never guess.
-Important constraints:
-- Identify the table headers first. Map fields ONLY by these headers (or explicit synonyms below).
-- MPL column: header EXACTLY "MPL" or synonyms {"MIN PRESENTATION LEVEL","MIN PRESENTATION","MIN FACING","MIN FACES"}.
-- SOH column: header EXACTLY "SOH" or synonyms {"STOCK ON HAND"}.
-- Article: header {"ARTICLE","ARTICLE #","ARTICLE NO","ART","ITEM","ITEM NO"} (numeric/string id).
-- Description: header {"DESCRIPTION","DESC"}.
-- IGNORE "CAPACITY"/"CAPCITY" columns completely. They are NOT MPL or SOH.
-- Do NOT use totals/subtotals or footer text. Only take values from the same ROW as the Article.
-- Return integers for MPL and SOH (no strings).
-- Keep description human-friendly and do NOT include supplier prefixes/codes that come before the real name (e.g., remove short all-caps prefixes like "PI", "WW", "BW" at the start of the description if present).
+You are a precise retail inventory parser. Extract data STRICTLY by table column headers.
+
+The report header includes many columns such as:
+"Description  OM  Article  ...  MPL  Capcity  SOH"
+Rules:
+- Map fields ONLY by header names (or clear synonyms).
+- MPL column: header exactly "MPL".
+- SOH column: header exactly "SOH".
+- Capacity column may appear as "Capcity" (misspelled). Do NOT treat Capacity as MPL or SOH.
+- OM is near the start of the row and is NOT MPL.
+- Article: 5-8+ digit identifier.
+- Description: human-friendly item name; remove supplier prefixes like "PI ", "WW ", "BW " if present at the start.
+- Use integers for MPL and SOH.
+- IMPORTANT: In each row, the *last three* numeric columns are in the order: MPL, Capcity, SOH. If ambiguous, rely on header names and this right-edge ordering.
+- Never swap MPL with SOH. If uncertain, do not guess; leave a note in raw_row and choose the values as per header positions.
 - Only include rows where SOH ≤ MPL.
 `;
 
-// Short user prompt that references the file and the goal
 const userPrompt = `
 Task: From this document, return ONLY the items where SOH ≤ MPL.
-Fields per row: article (ID), description (clean), mpl (int), soh (int).
-Ignore capacity/capcity. Map strictly by table headers (see rules).
-Return JSON exactly matching the provided schema.
+Return JSON matching the provided schema. Also include optional fields:
+- capacity (number extracted from "Capcity"),
+- om (number from "OM"),
+- mpl_header and soh_header (exact header text you used),
+- raw_row (the raw text of the row you read).
 `;
 
-// ----- small helpers to harden the result server-side -----
+/** ---------- Helpers ---------- */
 function cleanDescription(desc) {
   if (!desc || typeof desc !== 'string') return '';
   // strip supplier prefixes like "PI ", "WW ", "BW " at the very start
-  const cleaned = desc.replace(/^[A-Z]{1,3}\s+(?=[A-Za-z0-9])/, '');
-  // trim & collapse spaces
+  const cleaned = desc.replace(/^[A-Z]{1,3}\s+(?=[A-Za-z0-9])/u, '');
   return cleaned.trim().replace(/\s{2,}/g, ' ');
 }
 function toInt(n) {
@@ -60,7 +71,16 @@ function toInt(n) {
   const x = parseInt(String(n).replace(/[, ]/g, ''), 10);
   return Number.isFinite(x) ? x : 0;
 }
+function looksSwapped(mpl, soh, capacity, om) {
+  // Common failure: MPL mistakenly taken from OM or Capacity.
+  // If SOH > MPL by a wide margin AND capacity === mpl, it's likely swapped.
+  if (capacity != null && mpl === capacity && soh > mpl) return true;
+  // If mpl equals om (and om is in the small floaty range like 3, 9, 22.5) and soh is the largest tail value:
+  if (om != null && mpl === om && soh > mpl) return true;
+  return false;
+}
 
+/** ---------- Endpoint ---------- */
 export const POST = async ({ request, platform }) => {
   try {
     const form = await request.formData();
@@ -84,20 +104,17 @@ export const POST = async ({ request, platform }) => {
 
     const openai = new OpenAI({ apiKey, baseURL });
 
-    // 1) Upload PDF and get file_id
+    // 1) Upload and get file_id
     const uploaded = await openai.files.create({
       file,
       purpose: 'assistants'
     });
 
-    // 2) Responses API with Structured Outputs (json schema under text.format)
+    // 2) Ask for structured output anchored to headers
     const resp = await openai.responses.create({
       model,
       input: [
-        {
-          role: 'system',
-          content: [{ type: 'input_text', text: systemPrompt }]
-        },
+        { role: 'system', content: [{ type: 'input_text', text: systemPrompt }] },
         {
           role: 'user',
           content: [
@@ -116,10 +133,9 @@ export const POST = async ({ request, platform }) => {
       }
     });
 
-    // 3) Parse model output JSON
+    // 3) Extract JSON
     let outStr = resp?.output_text;
     if (!outStr) {
-      // fallback just in case SDK shape differs
       try {
         const first = resp?.output?.[0]?.content?.find?.(p => p.type === 'output_text');
         if (first?.text) outStr = first.text;
@@ -127,27 +143,46 @@ export const POST = async ({ request, platform }) => {
     }
     if (!outStr) outStr = JSON.stringify({ rows: [] });
 
+    /** 4) Harden and validate rows server-side */
     let data = {};
     try { data = JSON.parse(outStr); } catch { data = { rows: [] }; }
 
-    // 4) Server-side hardening:
-    //    - normalize description (strip supplier codes)
-    //    - ensure integers
-    //    - final filter SOH ≤ MPL (defensive)
-    const cleanedRows = Array.isArray(data.rows) ? data.rows.map(r => ({
-      article: String(r.article ?? '').trim(),
-      description: cleanDescription(r.description),
-      mpl: toInt(r.mpl),
-      soh: toInt(r.soh)
-    })) : [];
+    const cleaned = Array.isArray(data.rows) ? data.rows.map(r => {
+      const mpl = toInt(r.mpl);
+      const soh = toInt(r.soh);
+      const capacity = r.capacity != null ? toInt(r.capacity) : null;
+      const om = r.om != null ? toInt(r.om) : null;
 
-    const finalRows = cleanedRows.filter(r => r.article && r.mpl >= 0 && r.soh >= 0 && r.soh <= r.mpl);
+      return {
+        article: String(r.article ?? '').trim(),
+        description: cleanDescription(r.description),
+        mpl,
+        soh,
+        capacity,
+        om,
+        mpl_header: (r.mpl_header || '').toString().trim().toUpperCase(),
+        soh_header: (r.soh_header || '').toString().trim().toUpperCase(),
+        raw_row: (r.raw_row || '').toString()
+      };
+    }) : [];
+
+    // Validation: must map from explicit headers, must not look swapped, must satisfy the inequality
+    const finalRows = cleaned.filter(r => {
+      const headerOK =
+        (!r.mpl_header || r.mpl_header === 'MPL') &&
+        (!r.soh_header || r.soh_header === 'SOH');
+
+      if (!r.article || r.mpl < 0 || r.soh < 0) return false;
+      if (!headerOK) return false;
+      if (looksSwapped(r.mpl, r.soh, r.capacity, r.om)) return false;
+      return r.soh <= r.mpl;
+    }).map(({ article, description, mpl, soh }) => ({ article, description, mpl, soh }));
 
     return new Response(JSON.stringify({ rows: finalRows }), {
       headers: { 'content-type': 'application/json' }
     });
+
   } catch (e) {
-    // Surface useful errors (quota, auth, etc.)
     try {
       const detail = e?.response ? await e.response.text() : e?.message || String(e);
       return new Response(detail, { status: e?.status || 500, headers: { 'content-type': 'application/json' } });

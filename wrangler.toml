@@ -1,0 +1,5 @@
+name = "mplcompiler-pages"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Pages will still use your environment variables from its dashboard.

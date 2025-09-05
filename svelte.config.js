@@ -1,9 +1,11 @@
+// svelte.config.js
 import adapter from '@sveltejs/adapter-cloudflare';
-import { vitePreprocess } from '@sveltejs/kit/vite';
 
-export default {
+const config = {
   kit: {
     adapter: adapter()
-  },
-  preprocess: vitePreprocess()
+  }
+  // no preprocess needed for Tailwind/PostCSS
 };
+
+export default config;

@@ -1,7 +1,6 @@
 import OpenAI from 'openai';
-import type { RequestHandler } from './$types';
 
-// Pure JSON Schema (no "name" here)
+// ---- Strict JSON Schema for the table we want back ----
 const jsonSchema = {
   type: 'object',
   properties: {
@@ -22,42 +21,54 @@ const jsonSchema = {
   },
   required: ['rows'],
   additionalProperties: false
-} as const;
+};
 
-const baseInstructions =
-  `You are a retail inventory parser. Given an inventory document (may be a PDF with tables),
+// ---- Prompt given to the model ----
+const baseInstructions = `
+You are a retail inventory parser. Given an inventory document (often a PDF with tables),
 extract ONLY the rows where SOH ≤ MPL. Ignore rows where MPL is missing or SOH is blank.
 For each matched row return: article (ID), description (clean text), mpl (number), soh (number).
-Return JSON matching the provided schema exactly.`;
+Return JSON matching the provided schema exactly.
+`;
 
-export const POST: RequestHandler = async ({ request, platform }) => {
+/** @type {import('@sveltejs/kit').RequestHandler} */
+export const POST = async ({ request, platform }) => {
   try {
     const form = await request.formData();
-    const provider = (form.get('provider') as string) || 'openai';
-    const file = form.get('file') as File | null;
+    const provider = (form.get('provider') || 'openai').toString();
+    const file = form.get('file');
 
-    if (!file) return new Response('No file', { status: 400 });
+    if (!file) {
+      return new Response('No file', { status: 400 });
+    }
+
     if (provider !== 'openai') {
       return new Response(
-        JSON.stringify({ error: 'Gemini path is not enabled on Cloudflare in this starter. Use OpenAI for now.' }),
+        JSON.stringify({ error: 'Gemini path is not enabled in this starter. Use OpenAI for now.' }),
         { status: 400, headers: { 'content-type': 'application/json' } }
       );
     }
 
     const apiKey = platform?.env?.OPENAI_API_KEY;
-    if (!apiKey) return new Response('Missing OPENAI_API_KEY', { status: 500 });
+    if (!apiKey) {
+      return new Response('Missing OPENAI_API_KEY', { status: 500 });
+    }
 
     const model = platform?.env?.OPENAI_MODEL || 'gpt-4o-mini';
-    const openai = new OpenAI({ apiKey, baseURL: platform?.env?.OPENAI_BASE_URL });
+    const baseURL = platform?.env?.OPENAI_BASE_URL; // optional
 
-    // Upload file, then reference by id
+    const openai = new OpenAI({ apiKey, baseURL });
+
+    // 1) Upload the file to OpenAI and get a file_id
     const uploaded = await openai.files.create({
-      file,                // File from FormData (Workers-compatible)
-      purpose: 'assistants'
+      file,                 // File object from FormData (Workers-compatible)
+      purpose: 'assistants' // works for Responses API file references
     });
 
+    // 2) Call the Responses API with Structured Outputs (new shape)
     const resp = await openai.responses.create({
       model,
+      modalities: ['text'],
       input: [
         {
           role: 'user',
@@ -67,23 +78,21 @@ export const POST: RequestHandler = async ({ request, platform }) => {
           ]
         }
       ],
-      // ✅ Responses API requires a name under text.format
       text: {
         format: {
           type: 'json_schema',
-          name: 'InventoryRows',           // <— add this
-          json_schema: {
-            schema: jsonSchema,
-            strict: true
-          }
+          name: 'InventoryRows', // REQUIRED at this level
+          schema: jsonSchema,    // pure JSON Schema object
+          strict: true
         }
       }
     });
 
-    const out = (resp as any).output_text ?? JSON.stringify({ rows: [] });
+    // 3) Structured outputs return as a JSON string in output_text
+    const out = resp?.output_text ?? JSON.stringify({ rows: [] });
     return new Response(out, { headers: { 'content-type': 'application/json' } });
-
-  } catch (e: any) {
-    return new Response(e?.message ?? 'Server error', { status: 500 });
+  } catch (e) {
+    const msg = (e && typeof e === 'object' && 'message' in e) ? e.message : String(e);
+    return new Response(msg, { status: 500 });
   }
 };

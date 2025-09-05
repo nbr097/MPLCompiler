@@ -24,14 +24,14 @@
     }
   });
 
-  function withTimeout<T>(p: Promise<T>, ms = 70_000) {
-    return Promise.race([
-      p,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
-      )
-    ]);
-  }
+  function withTimeout<T>(p: Promise<T>, ms = 130_000) {
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
+    )
+  ]);
+}
 
   async function submit() {
     if (!file) { error = 'Choose a file first.'; return; }

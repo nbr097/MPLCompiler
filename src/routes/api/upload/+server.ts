@@ -1,7 +1,6 @@
 import OpenAI from 'openai';
 
-/** ---------- Strict JSON Schema (all keys required) ---------- */
-/* OpenAI Structured Outputs wants all properties listed in `required`. */
+/** ---------- STRICT schema: use rightmost triple only ---------- */
 const jsonSchema = {
   type: 'object',
   properties: {
@@ -12,23 +11,23 @@ const jsonSchema = {
         properties: {
           article: { type: 'string' },
           description: { type: 'string' },
-          mpl: { type: 'number' },
-          soh: { type: 'number' },
-          capacity: { type: 'number' },     // from "Capcity" column (misspelled in report)
-          om: { type: 'number' },           // from "OM" column
-          mpl_header: { type: 'string' },   // exact header used for mpl
-          soh_header: { type: 'string' },   // exact header used for soh
-          raw_row: { type: 'string' }       // raw text of the parsed row
+
+          // RIGHTMOST THREE numeric columns in order (no guessing):
+          rightmost_mpl: { type: 'number' },      // value from the rightmost trio position #1
+          rightmost_capcity: { type: 'number' },  // value from the rightmost trio position #2 (spelled "Capcity" in the report)
+          rightmost_soh: { type: 'number' },      // value from the rightmost trio position #3
+
+          // extra context (always present to satisfy validator)
+          om: { type: 'number' },                 // OM near start (NOT used for filter)
+          raw_row: { type: 'string' }             // raw textual row you parsed
         },
         required: [
           'article',
           'description',
-          'mpl',
-          'soh',
-          'capacity',
+          'rightmost_mpl',
+          'rightmost_capcity',
+          'rightmost_soh',
           'om',
-          'mpl_header',
-          'soh_header',
           'raw_row'
         ],
         additionalProperties: false
@@ -39,42 +38,41 @@ const jsonSchema = {
   additionalProperties: false
 };
 
-/** ---------- Prompts (header-anchored rules) ---------- */
+/** ---------- Prompts (position-locked) ---------- */
 const systemPrompt = `
-You are a precise retail inventory parser. Extract data STRICTLY by table column headers.
+You are a precise retail inventory parser. Do NOT guess. Read table rows and extract by POSITION.
 
-Typical header layout includes (order varies):
-"Description  OM  Article  ...  MPL  Capcity  SOH"
+CRITICAL:
+- Every row ends with a block of three numeric columns at the right edge.
+- Those three (in left→right order) are EXACTLY:
+  [ 1st = MPL,  2nd = Capcity (capacity, may be misspelled),  3rd = SOH ].
+- Ignore any other numeric columns (e.g. OM). OM appears near the start and is not part of the rightmost trio.
 
-Rules:
-- Map fields ONLY by header names (or obvious synonyms).
-- MPL column: header exactly "MPL".
-- SOH column: header exactly "SOH".
-- Capacity column may appear as "Capcity" (misspelled). Do NOT treat Capacity as MPL or SOH.
-- OM appears near the start of rows and is NOT MPL or SOH.
-- Article: 5–8+ digit identifier.
-- Description: human-friendly name; remove supplier prefixes like "PI ", "WW ", "BW " if they appear at the very start.
-- IMPORTANT: On each row, the rightmost trio is typically "MPL  Capcity  SOH". Use header names first; if OCR is ambiguous, fall back to this right-edge ordering.
-- Never swap MPL with SOH. If uncertain, reflect what you used in mpl_header/soh_header and include raw_row for traceability.
-- Integers only for mpl, soh, capacity, om (no strings).
-- Only include rows where SOH ≤ MPL.
-- Output all required fields. If a numeric cell is blank, return 0. If a string cell is blank, return "".
+For EACH row:
+1) Return the three rightmost numeric values as:
+   rightmost_mpl, rightmost_capcity, rightmost_soh — in that exact order. Never swap or reorder.
+2) Also return:
+   - article (ID) from its column,
+   - description (human-friendly name; strip any supplier prefixes like "PI " at the very start),
+   - om (the OM value near the start; if blank, return 0),
+   - raw_row (the raw text of the line you read).
+3) Integers only for all numbers. If a cell is blank, return 0.
+
+IMPORTANT:
+- Do not rename or map these three; just take them by position.
+- Do not use sums/totals/footers.
+- Only include rows in your output where rightmost_soh ≤ rightmost_mpl.
 `;
 
 const userPrompt = `
-Task: From this document, return ONLY the items where SOH ≤ MPL.
-Return JSON that matches the provided schema exactly (all fields required).
-Include:
-- capacity (from "Capcity"),
-- om (from "OM"),
-- mpl_header and soh_header (the exact header names you used),
-- raw_row (the raw text of the line you read).
+Goal: Return ONLY items where SOH ≤ MPL using the RIGHTMOST-THREE rule above.
+Output must match the JSON schema exactly. Numbers are integers; blanks become 0.
 `;
 
 /** ---------- Helpers ---------- */
 function cleanDescription(desc) {
   if (!desc || typeof desc !== 'string') return '';
-  // strip supplier prefixes like "PI ", "WW ", "BW " at the very start
+  // remove short supplier prefixes like "PI ", "WW ", "BW " at the very start
   const cleaned = desc.replace(/^[A-Z]{1,3}\s+(?=[A-Za-z0-9])/u, '');
   return cleaned.trim().replace(/\s{2,}/g, ' ');
 }
@@ -83,14 +81,7 @@ function toInt(n) {
   const x = parseInt(String(n).replace(/[, ]/g, ''), 10);
   return Number.isFinite(x) ? x : 0;
 }
-function looksSwapped(mpl, soh, capacity, om) {
-  // Heuristics to catch MPL/SOH swaps or MPL==Capacity mistakes
-  if (capacity != null && mpl === capacity && soh > mpl) return true;
-  if (om != null && mpl === om && soh > mpl) return true;
-  return false;
-}
 
-/** ---------- Endpoint ---------- */
 export const POST = async ({ request, platform }) => {
   try {
     const form = await request.formData();
@@ -98,7 +89,6 @@ export const POST = async ({ request, platform }) => {
     const file = form.get('file');
 
     if (!file) return new Response('No file', { status: 400 });
-
     if (provider !== 'openai') {
       return new Response(
         JSON.stringify({ error: 'Gemini path not enabled in this starter. Use OpenAI for now.' }),
@@ -114,13 +104,13 @@ export const POST = async ({ request, platform }) => {
 
     const openai = new OpenAI({ apiKey, baseURL });
 
-    // 1) Upload and get file_id
+    // 1) Upload file, get file_id
     const uploaded = await openai.files.create({
       file,
       purpose: 'assistants'
     });
 
-    // 2) Ask for structured output anchored to headers
+    // 2) Responses API with Structured Outputs (position-locked)
     const resp = await openai.responses.create({
       model,
       input: [
@@ -136,14 +126,14 @@ export const POST = async ({ request, platform }) => {
       text: {
         format: {
           type: 'json_schema',
-          name: 'InventoryRows',
+          name: 'RightmostTripleRows',
           schema: jsonSchema,
           strict: true
         }
       }
     });
 
-    // 3) Extract text JSON
+    // 3) Extract JSON text
     let outStr = resp?.output_text;
     if (!outStr) {
       try {
@@ -153,42 +143,24 @@ export const POST = async ({ request, platform }) => {
     }
     if (!outStr) outStr = JSON.stringify({ rows: [] });
 
-    // 4) Harden + validate
+    // 4) Harden + map to final rows
     let data = {};
     try { data = JSON.parse(outStr); } catch { data = { rows: [] }; }
 
-    const cleaned = Array.isArray(data.rows) ? data.rows.map(r => {
-      const mpl = toInt(r.mpl);
-      const soh = toInt(r.soh);
-      const capacity = toInt(r.capacity);
-      const om = toInt(r.om);
+    const finalRows = Array.isArray(data.rows) ? data.rows.map(r => {
+      const mpl = toInt(r.rightmost_mpl);
+      const soh = toInt(r.rightmost_soh);
 
       return {
         article: String(r.article ?? '').trim(),
         description: cleanDescription(r.description),
         mpl,
-        soh,
-        capacity,
-        om,
-        mpl_header: (r.mpl_header || '').toString().trim().toUpperCase(),
-        soh_header: (r.soh_header || '').toString().trim().toUpperCase(),
-        raw_row: (r.raw_row || '').toString()
+        soh
       };
-    }) : [];
-
-    // Must come from correct headers, not look swapped, and satisfy inequality
-    const finalRows = cleaned
-      .filter(r => {
-        const headerOK =
-          (!r.mpl_header || r.mpl_header === 'MPL') &&
-          (!r.soh_header || r.soh_header === 'SOH');
-
-        if (!r.article) return false;
-        if (!headerOK) return false;
-        if (looksSwapped(r.mpl, r.soh, r.capacity, r.om)) return false;
-        return r.soh <= r.mpl;
-      })
-      .map(({ article, description, mpl, soh }) => ({ article, description, mpl, soh }));
+    })
+    // Defensive re-filter in case the model slipped a violating row in:
+    .filter(r => r.article && r.soh <= r.mpl)
+    : [];
 
     return new Response(JSON.stringify({ rows: finalRows }), {
       headers: { 'content-type': 'application/json' }

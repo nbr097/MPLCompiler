@@ -267,14 +267,6 @@
                     <div class="text-xs text-slate-500">Pages scanned</div>
                     <div class="text-lg font-semibold">{meta.pages_scanned}/{meta.pages_total}</div>
                   </div>
-                  <div class="rounded-xl bg-slate-100 dark:bg-slate-800/70 p-3">
-                    <div class="text-xs text-slate-500">Mode</div>
-                    <div class="text-sm">{meta.mode_used?.join(', ')}</div>
-                  </div>
-                  <div class="rounded-xl bg-slate-100 dark:bg-slate-800/70 p-3">
-                    <div class="text-xs text-slate-500">Scanned images</div>
-                    <div class="text-lg font-semibold">{meta.scanned_image_pages}</div>
-                  </div>
                 </div>
               {:else}
                 <div class="rounded-xl bg-slate-100 dark:bg-slate-800/70 p-4 text-slate-600 dark:text-slate-300">

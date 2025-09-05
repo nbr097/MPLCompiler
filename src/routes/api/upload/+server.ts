@@ -1,6 +1,16 @@
 import OpenAI from 'openai';
 
-/** STRICT schema: only what we need the model to provide reliably */
+/**
+ * We ask the model for:
+ *  - header-anchored MPL/SOH (strictly from "MPL" and "SOH" headers)
+ *  - the rightmost trio (SOH, MPL, Capacity) as a second source of truth
+ *  - exact headers used and a raw_row string for traceability
+ *
+ * On the server we then:
+ *  - prefer header-anchored numbers when headers are correct
+ *  - fall back to the rightmost trio when headers look wrong or swapped
+ *  - never return Capacity; UI only gets article, description, mpl, soh
+ */
 const jsonSchema = {
   type: 'object',
   properties: {
@@ -9,11 +19,35 @@ const jsonSchema = {
       items: {
         type: 'object',
         properties: {
-          article: { type: 'string' },     // item ID from its column
-          description: { type: 'string' }, // human-friendly name (no supplier prefix)
-          raw_row: { type: 'string' }      // the full text of the row INCLUDING the final numeric trio
+          article: { type: 'string' },
+          description: { type: 'string' },
+
+          // Header-mapped values (primary)
+          mpl: { type: 'number' },               // from column header "MPL"
+          soh: { type: 'number' },               // from column header "SOH"
+          mpl_header: { type: 'string' },        // exact header string used for mpl
+          soh_header: { type: 'string' },        // exact header string used for soh
+
+          // Rightmost trio (secondary, for validation only)
+          tail_soh: { type: 'number' },          // left of the last-three at far right
+          tail_mpl: { type: 'number' },          // middle of the last-three at far right
+          tail_capacity: { type: 'number' },     // rightmost of the last-three (a.k.a. "Capcity")
+
+          // Traceability
+          raw_row: { type: 'string' }
         },
-        required: ['article', 'description', 'raw_row'],
+        required: [
+          'article',
+          'description',
+          'mpl',
+          'soh',
+          'mpl_header',
+          'soh_header',
+          'tail_soh',
+          'tail_mpl',
+          'tail_capacity',
+          'raw_row'
+        ],
         additionalProperties: false
       }
     }
@@ -22,35 +56,44 @@ const jsonSchema = {
   additionalProperties: false
 };
 
-/** Prompts: row text capture, NOT numeric mapping */
 const systemPrompt = `
-You are a precise PDF table transcriber. Do NOT guess or infer values.
+You are a precise inventory table parser. Do NOT guess; follow these rules exactly.
 
-For each table ROW:
-- Return:
-  • article = item ID from its "Article" column (digits)
-  • description = item name (remove supplier prefixes like "PI " at the very start)
-  • raw_row = the VERBATIM single-line text for that row as it appears, INCLUDING the final three numeric cells at the far right
+Headers & mapping (PRIMARY SOURCE):
+- Read MPL strictly from the column with header text exactly "MPL".
+- Read SOH strictly from the column with header text exactly "SOH".
+- Never use "Capacity" (sometimes spelled "Capcity") for MPL or SOH.
+- OM is unrelated; never use OM for MPL or SOH.
 
-IMPORTANT layout rule:
-- At the far right of each row, the last three numeric cells appear left→right as: SOH, MPL, Capacity (Capacity may be spelled "Capcity").
-- Do NOT label or reorder those numbers yourself. Simply ensure raw_row ends with these three numbers in the exact order they appear.
-- If a numeric cell is blank, it may be rendered as 0 — keep the sequence and spacing as-is.
+Right-edge trio (SECONDARY SOURCE for validation only):
+- At the far right of each row there are three numeric cells in left→right order:
+  [ SOH , MPL , Capacity ]   (Capacity may appear as "Capcity").
+- Extract those three numbers into tail_soh, tail_mpl, tail_capacity.
 
-Never output totals/footers.
-Return integers and plain text only; no extra keys beyond the schema.
+Output requirements for each row object:
+- article: item ID from the "Article" column (digits/string)
+- description: clean item name without supplier prefixes (e.g., remove leading "PI " / "WW " / "BW ")
+- mpl, soh: integers from the PRIMARY header-mapped columns only
+- mpl_header, soh_header: the exact header strings used for those values
+- tail_soh, tail_mpl, tail_capacity: integers from the rightmost trio (secondary)
+- raw_row: the verbatim text of the row you read, including the final numbers
+
+General:
+- Integers only for all numbers; if a cell is blank, output 0.
+- Do NOT output totals/footers or header rows.
+- You may include rows where SOH > MPL; filtering is done server-side.
 `;
 
 const userPrompt = `
-Task: Transcribe table rows from the document.
-Return only article, description, and raw_row (verbatim).
-Do NOT try to compute MPL or SOH — we will derive them from raw_row.
+Task: Extract rows from the document per the rules.
+Return JSON that matches the provided schema exactly.
 `;
 
-/** Helpers */
+/* ---------------- Helpers ---------------- */
+
 function cleanDescription(desc) {
   if (!desc || typeof desc !== 'string') return '';
-  // remove short supplier prefixes like "PI ", "WW ", "BW " at the very start
+  // strip short supplier prefixes like "PI ", "WW ", "BW " at the very start
   const cleaned = desc.replace(/^[A-Z]{1,3}\s+(?=[A-Za-z0-9])/u, '');
   return cleaned.trim().replace(/\s{2,}/g, ' ');
 }
@@ -61,19 +104,41 @@ function toInt(n) {
   return Number.isFinite(x) ? x : 0;
 }
 
-/** Extract the last three integers from a row of text (left→right order) */
-function extractTailTriple(raw) {
-  if (!raw) return null;
-  // Match integers (allow thousands separators before joining)
-  const matches = [...raw.matchAll(/(\d{1,3}(?:,\d{3})*|\d+)(?![^\s])/g)].map(m => m[1]);
-  // Fallback if the above anchors to end-of-token too strictly:
-  const allNums = matches.length ? matches : [...raw.matchAll(/\d{1,3}(?:,\d{3})*|\d+/g)].map(m => m[0]);
+/**
+ * Decide final (mpl, soh) using:
+ *  1) header-anchored values if headers look correct: MPL->"MPL" & SOH->"SOH"
+ *  2) otherwise, fall back to the rightmost trio (soh=tail_soh, mpl=tail_mpl)
+ *  3) if header values equal tail_capacity or look swapped, prefer tail_* pair
+ */
+function chooseFinalPair(row) {
+  const mh = (row.mpl_header || '').toString().trim().toUpperCase();
+  const sh = (row.soh_header || '').toString().trim().toUpperCase();
 
-  if (allNums.length < 3) return null;
-  const a = allNums.slice(-3).map(s => toInt(s));
-  // a[0]=SOH, a[1]=MPL, a[2]=Capacity per your layout
-  return { soh: a[0], mpl: a[1], capacity: a[2] };
+  const headerLooksRight = (mh === 'MPL' && sh === 'SOH');
+
+  const h_mpl = toInt(row.mpl);
+  const h_soh = toInt(row.soh);
+  const t_mpl = toInt(row.tail_mpl);
+  const t_soh = toInt(row.tail_soh);
+  const t_cap = toInt(row.tail_capacity);
+
+  // obvious swap patterns: header MPL equals capacity or equals tail SOH, etc.
+  const headerLooksSwapped =
+    (h_mpl === t_cap && t_mpl !== t_cap) || // MPL accidentally taken from capacity
+    (h_mpl === t_soh && h_soh === t_mpl);   // pure swap
+
+  // prefer header when headers are correct AND not swapped AND non-zero-ish
+  const headerUsable = headerLooksRight && !headerLooksSwapped && !(h_mpl === 0 && t_mpl > 0);
+
+  if (headerUsable) {
+    return { mpl: h_mpl, soh: h_soh };
+  }
+
+  // fallback to rightmost trio
+  return { mpl: t_mpl, soh: t_soh };
 }
+
+/* ---------------- Endpoint ---------------- */
 
 export const POST = async ({ request, platform }) => {
   try {
@@ -92,7 +157,8 @@ export const POST = async ({ request, platform }) => {
     const apiKey = platform?.env?.OPENAI_API_KEY;
     if (!apiKey) return new Response('Missing OPENAI_API_KEY', { status: 500 });
 
-    const model = platform?.env?.OPENAI_MODEL || 'gpt-4o-mini';
+    // Show the model back to the UI for transparency
+    const model = platform?.env?.OPENAI_MODEL || 'gpt-5';
     const baseURL = platform?.env?.OPENAI_BASE_URL;
 
     const openai = new OpenAI({ apiKey, baseURL });
@@ -103,7 +169,7 @@ export const POST = async ({ request, platform }) => {
       purpose: 'assistants'
     });
 
-    // 2) Ask ONLY for article/description/raw_row (structured output)
+    // 2) Responses API + Structured Outputs (temperature 0 to avoid "creative" swaps)
     const resp = await openai.responses.create({
       model,
       input: [
@@ -119,14 +185,16 @@ export const POST = async ({ request, platform }) => {
       text: {
         format: {
           type: 'json_schema',
-          name: 'RowTranscription',
+          name: 'InventoryRows',
           schema: jsonSchema,
           strict: true
         }
-      }
+      },
+      temperature: 0,
+      max_output_tokens: 4000
     });
 
-    // 3) Pull the JSON string
+    // 3) Extract JSON text from Responses API
     let outStr = resp?.output_text;
     if (!outStr) {
       try {
@@ -136,27 +204,24 @@ export const POST = async ({ request, platform }) => {
     }
     if (!outStr) outStr = JSON.stringify({ rows: [] });
 
-    // 4) Deterministic parsing of SOH/MPL from raw_row tail
+    // 4) Harden, choose final values, and filter SOH ≤ MPL
     let data = {};
     try { data = JSON.parse(outStr); } catch { data = { rows: [] }; }
 
-    const rows = Array.isArray(data.rows) ? data.rows : [];
+    const finalRows = (Array.isArray(data.rows) ? data.rows : [])
+      .map((r) => {
+        const { mpl, soh } = chooseFinalPair(r);
+        return {
+          article: String(r.article ?? '').trim(),
+          description: cleanDescription(r.description),
+          mpl,
+          soh
+        };
+      })
+      .filter(r => r.article && r.soh <= r.mpl);
 
-    const finalRows = rows.map(r => {
-      const article = String(r.article ?? '').trim();
-      const description = cleanDescription(r.description);
-      const triple = extractTailTriple(String(r.raw_row ?? ''));
-
-      if (!triple) return null;
-      const { soh, mpl } = triple;
-
-      return { article, description, mpl, soh };
-    })
-    .filter(Boolean)
-    // apply your filter
-    .filter(r => r.article && r.soh <= r.mpl);
-
-    return new Response(JSON.stringify({ rows: finalRows }), {
+    // Echo the model so the UI can display it
+    return new Response(JSON.stringify({ model, rows: finalRows }), {
       headers: { 'content-type': 'application/json' }
     });
 

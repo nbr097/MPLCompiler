@@ -126,8 +126,8 @@
             <tr>
               <td>{r.article}</td>
               <td>{r.description}</td>
-              <td>{r.mpl}</td>
               <td>{r.soh}</td>
+              <td>{r.mpl}</td>
             </tr>
           {/each}
         </tbody>

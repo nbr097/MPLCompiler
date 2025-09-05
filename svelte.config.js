@@ -1,9 +1,13 @@
 import adapter from '@sveltejs/adapter-cloudflare';
 
-const config = {
+export default {
   kit: {
-    adapter: adapter()
+    adapter: adapter(),
+    prerender: {
+      handleHttpError: ({ path, message }) => {
+        if (message.includes('404') && path === '/favicon.png') return; // ignore this one
+        throw new Error(message);
+      }
+    }
   }
 };
-
-export default config;

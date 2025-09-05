@@ -2,4 +2,5 @@ name = "mplcompiler-pages"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Pages will still use your environment variables from its dashboard.
+# Tell Pages where the build output is (adapter-cloudflare writes here)
+pages_build_output_dir = ".svelte-kit/cloudflare"

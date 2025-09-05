@@ -169,7 +169,7 @@ export const POST = async ({ request, platform }) => {
       purpose: 'assistants'
     });
 
-    // 2) Responses API + Structured Outputs (temperature 0 to avoid "creative" swaps)
+    // 2) Responses API + Structured Outputs (no temperature param)
     const resp = await openai.responses.create({
       model,
       input: [
@@ -189,9 +189,9 @@ export const POST = async ({ request, platform }) => {
           schema: jsonSchema,
           strict: true
         }
-      },
-      temperature: 0,
-      max_output_tokens: 4000
+      }
+      // NOTE: Some models reject extra params like `temperature` or `max_output_tokens`,
+      // so we omit them for compatibility.
     });
 
     // 3) Extract JSON text from Responses API

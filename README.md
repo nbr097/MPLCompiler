@@ -1,4 +1,4 @@
-# MPLCompiler — Inventory Filter & Label Printer
+# MPLCompiler — Inventory Filter & Label Printer 😊
 
 A tiny SvelteKit app that ingests a store report (PDF), extracts only the items where **SOH ≤ MPL**, and gives you clean outputs:
 

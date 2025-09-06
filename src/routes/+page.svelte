@@ -187,7 +187,7 @@
   <header class="sticky top-0 z-30 border-b border-slate-200/60 bg-white/70 dark:bg-slate-950/60 backdrop-blur-md">
     <div class="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
       <div class="flex items-center gap-3">
-        <div class="h-8 w-8 rounded-xl bg-sky-600"></div>
+      <!--  <div class="h-8 w-8 rounded-xl bg-sky-600"></div> -->
         <div class="text-lg font-semibold tracking-tight">Inventory Filter</div>
       </div>
       <div class="flex items-center gap-2">
@@ -285,7 +285,7 @@
             <div class="mt-4 space-y-3 text-sm">
               {#if meta}
                 <div class="grid grid-cols-2 gap-3">
-                  <div class="rounded-xl bg-slate-100 dark:bg-slate-8 00/70 p-3">
+                  <div class="rounded-xl bg-slate-100 dark:bg-slate-800/70 p-3">
                     <div class="text-xs text-slate-500">Rows returned</div>
                     <div class="text-lg font-semibold">{meta.rows_returned}</div>
                   </div>
@@ -318,7 +318,7 @@
             <div class="ml-auto flex items-center gap-3">
               <button on:click={copyTSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Copy TSV</button>
               <button on:click={downloadCSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Download CSV</button>
-              <button on:click={printLabels} class="rounded-xl bg-black text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
+              <button on:click={printLabels} class="rounded-xl bg-sky-600 dark:bg-sky-600 text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
             </div>
           {/if}
         </div>

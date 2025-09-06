@@ -3,7 +3,7 @@
 A tiny SvelteKit app that ingests a store report (PDF), extracts only the items where **SOH ≤ MPL**, and gives you clean outputs:
 
 - A sortable results table (with **Code 39 barcodes** for each article)
-- One-click **CSV/TSV export**
+- One-click **CSV/TSV export** (If you remove the comments)
 - A dedicated **Labels** page with:
   - Live **column count** control (1–6 columns on A4)
   - **Auto-fitting barcodes** that scale to each label’s width

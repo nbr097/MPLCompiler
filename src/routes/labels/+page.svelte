@@ -166,7 +166,7 @@
           <button class="rounded-md border px-2 py-1 text-sm hover:bg-slate-50 dark:hover:bg-slate-800" on:click={() => nudgeCols(+1)} aria-label="Increase columns">＋</button>
           <span class="w-6 text-center text-sm tabular-nums">{cols}</span>
         </div>
-        <button on:click={handlePrint} class="rounded-lg bg-black text-white px-4 py-2 text-sm hover:opacity-90 disabled:opacity-50" disabled={!rows.length} aria-label="Print labels">Print</button>
+        <button on:click={handlePrint} class="rounded-lg bg-sky-600 text-white px-4 py-2 text-sm hover:opacity-90 disabled:opacity-50" disabled={!rows.length} aria-label="Print labels">Print</button>
       </div>
     </div>
   </div>

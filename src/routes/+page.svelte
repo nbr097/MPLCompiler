@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { goto } from '$app/navigation';
 
   // ---------- Types ----------
   type Row = { article: string; description: string; soh: number; mpl: number };
@@ -54,6 +55,20 @@
         setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
       )
     ]);
+  }
+
+  // Guarded Code 39 string: wrap in asterisks
+  function toCode39(value: string | number) {
+    const s = String(value ?? '').trim();
+    return `*${s}*`;
+  }
+
+  // Save rows and move to printable labels page
+  function printLabels() {
+    try {
+      sessionStorage.setItem('mpl_rows_v1', JSON.stringify(rows ?? []));
+    } catch { /* ignore quota issues */ }
+    goto('/labels');
   }
 
   async function uploadAndExtract() {
@@ -139,6 +154,21 @@
   const fileInputId = 'pdf-file-input';
   const pagesInputId = 'pages-input';
 </script>
+
+<svelte:head>
+  <!-- Libre Barcode 39 font for Code 39 barcodes -->
+  <link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+39&display=swap" rel="stylesheet" />
+  <style>
+    .barcode39 {
+      font-family: 'Libre Barcode 39', cursive;
+      line-height: 1;
+      letter-spacing: 0;
+      /* Size tuned for table; labels page can render larger */
+      font-size: 42px;
+      white-space: nowrap;
+    }
+  </style>
+</svelte:head>
 
 <!-- Page shell -->
 <div class="min-h-screen bg-gradient-to-b from-white to-slate-50 text-slate-900 dark:from-slate-950 dark:to-slate-900 dark:text-slate-100 transition-colors">
@@ -255,7 +285,7 @@
             <div class="mt-4 space-y-3 text-sm">
               {#if meta}
                 <div class="grid grid-cols-2 gap-3">
-                  <div class="rounded-xl bg-slate-100 dark:bg-slate-800/70 p-3">
+                  <div class="rounded-xl bg-slate-100 dark:bg-slate-8 00/70 p-3">
                     <div class="text-xs text-slate-500">Rows returned</div>
                     <div class="text-lg font-semibold">{meta.rows_returned}</div>
                   </div>
@@ -288,6 +318,7 @@
             <div class="ml-auto flex items-center gap-3">
               <button on:click={copyTSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Copy TSV</button>
               <button on:click={downloadCSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Download CSV</button>
+              <button on:click={printLabels} class="rounded-xl bg-black text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
             </div>
           {/if}
         </div>
@@ -311,8 +342,11 @@
               </thead>
               <tbody class="[&>tr:nth-child(odd)]:bg-white [&>tr:nth-child(even)]:bg-slate-50 dark:[&>tr:nth-child(odd)]:bg-slate-900/60 dark:[&>tr:nth-child(even)]:bg-slate-900/30">
                 {#each rows as r}
-                  <tr class="border-t border-slate-200 dark:border-slate-800">
-                    <td class="px-4 py-2 font-medium tabular-nums">{r.article}</td>
+                  <tr class="border-t border-slate-200 dark:border-slate-800 align-top">
+                    <td class="px-4 py-2 tabular-nums">
+                      <div class="font-medium">{r.article}</div>
+                      <div class="barcode39 text-black dark:text-white mt-1">{toCode39(r.article)}</div>
+                    </td>
                     <td class="px-4 py-2">{r.description}</td>
                     <td class="px-4 py-2 tabular-nums">{r.soh}</td>
                     <td class="px-4 py-2 tabular-nums">{r.mpl}</td>

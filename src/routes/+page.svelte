@@ -318,7 +318,7 @@
             <div class="ml-auto flex items-center gap-3">
               <button on:click={copyTSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Copy TSV</button>
               <button on:click={downloadCSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Download CSV</button>
-              <button on:click={printLabels} class="rounded-xl bg-sky-600 dark:bg-sky-600 text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
+              <button on:click={printLabels} target="_blank" class="rounded-xl bg-sky-600 dark:bg-sky-600 text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
             </div>
           {/if}
         </div>

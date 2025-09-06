@@ -1,17 +1,56 @@
-# MPLCompiler
-Upload an Inventory PDF and have the data scraped for easy read and check
+# MPLCompiler — Inventory Filter & Label Printer
 
-# Inventory Parser (Cloudflare Pages + SvelteKit)
+A tiny SvelteKit app that ingests a store report (PDF), extracts only the items where **SOH ≤ MPL**, and gives you clean outputs:
 
-- Upload an inventory PDF/CSV/XLSX.
-- Server calls python script with pdfplumber to scrape relevant data.
-- Returns only rows where **SOH ≤ MPL** as `{ rows: [...] }`.
+- A sortable results table (with **Code 39 barcodes** for each article)
+- One-click **CSV/TSV export**
+- A dedicated **Labels** page with:
+  - Live **column count** control (1–6 columns on A4)
+  - **Auto-fitting barcodes** that scale to each label’s width
+  - Print-friendly layout (A4 by default)
+- **Dark mode** toggle
+- **Drag-and-drop** upload anywhere on the page
+- **State persistence** (results survive Back/reload and can open Labels in a new tab)
 
-## Env vars (Cloudflare Pages → Settings → Environment variables)
-- PARSER_URL = https://inventory-pdf-parser.fly.dev/parse
+---
 
-## Local dev (optional)
+## Demo (flow)
+1. Upload or drop a PDF report.
+2. The app extracts rows where `SOH ≤ MPL`.
+3. Review the table (barcodes are shown under each article).
+4. Export CSV/TSV or click **Print labels** → opens `/labels` in a new tab.
+5. On the Labels page, adjust **Columns** (1–6); barcodes resize to fit; click **Print**.
+
+> Tip: If your browser blocks pop-ups, allow the site when you click **Print labels** (it opens `/labels` in a new tab).
+
+---
+
+## Tech Stack
+
+- **SvelteKit** (Vite)
+- **Tailwind-style utility classes** in markup
+- **Libre Barcode 39** (Google Fonts) for Code 39 barcodes
+- Minimal server endpoint: `POST /api/upload` (parses the PDF and returns JSON)
+
+---
+
+## Getting Started
+
+### Prerequisites
+- **Node.js 18+** (20+ recommended)
+- **npm** or **pnpm** or **yarn**
+
+### Install & Run
+
+```bash
+# clone
+git clone https://github.com/nbr097/MPLCompiler.git
+cd MPLCompiler
+
+# install deps
 npm i
+# or: pnpm i / yarn
+
+# dev
 npm run dev
-# For a Pages-like dev server you can also:
-# npx wrangler pages dev .svelte-kit/cloudflare
+# open the printed localhost URL

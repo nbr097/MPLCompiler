@@ -276,7 +276,7 @@
                 </label>
               </div>
 
-              <!-- Options -->
+              <!-- Options
               <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div class="sm:col-span-1">
                   <label for={pagesInputId} class="block text-sm font-medium text-slate-700 dark:text-slate-300">Pages to scan</label>
@@ -285,6 +285,7 @@
                     placeholder="0 = all" />
                 </div>
               </div>
+ -->
 
               <!-- Actions -->
               <div class="flex flex-wrap items-center gap-3 pt-2">

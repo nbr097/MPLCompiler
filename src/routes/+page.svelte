@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { goto } from '$app/navigation';
 
   // ---------- Types ----------
   type Row = { article: string; description: string; soh: number; mpl: number };
@@ -8,6 +7,10 @@
     pages_total: number; pages_scanned: number; rows_returned: number;
     rows_considered: number; limit_pages: number; mode_used: string[]; scanned_image_pages: number;
   } | null;
+
+  // ---------- Storage keys ----------
+  const STORAGE_ROWS_KEY = 'mpl_rows_v1';
+  const STORAGE_META_KEY = 'mpl_meta_v1';
 
   // ---------- State ----------
   let file: File | null = null;
@@ -29,6 +32,10 @@
     const saved = localStorage.getItem('theme');
     dark = saved ? saved === 'dark' : window.matchMedia?.('(prefers-color-scheme: dark)').matches;
     applyTheme();
+
+    // Restore previously extracted data so Back/reload shows the same table
+    restoreState();
+
     window.addEventListener('dragover', onDragOver);
     window.addEventListener('dragenter', onDragEnter);
     window.addEventListener('dragleave', onDragLeave);
@@ -63,12 +70,40 @@
     return `*${s}*`;
   }
 
-  // Save rows and move to printable labels page
-  function printLabels() {
+  // Persist rows/meta to storage (both local & session for flexibility)
+  function persistState() {
     try {
-      sessionStorage.setItem('mpl_rows_v1', JSON.stringify(rows ?? []));
+      const rowsJson = JSON.stringify(rows ?? []);
+      const metaJson = JSON.stringify(meta);
+      localStorage.setItem(STORAGE_ROWS_KEY, rowsJson);
+      localStorage.setItem(STORAGE_META_KEY, metaJson);
+      sessionStorage.setItem(STORAGE_ROWS_KEY, rowsJson);
+      sessionStorage.setItem(STORAGE_META_KEY, metaJson);
     } catch { /* ignore quota issues */ }
-    goto('/labels');
+  }
+  function restoreState() {
+    try {
+      const rawRows = localStorage.getItem(STORAGE_ROWS_KEY) || sessionStorage.getItem(STORAGE_ROWS_KEY);
+      const rawMeta = localStorage.getItem(STORAGE_META_KEY) || sessionStorage.getItem(STORAGE_META_KEY);
+      const r = rawRows ? JSON.parse(rawRows) : [];
+      const m = rawMeta ? JSON.parse(rawMeta) : null;
+      if (Array.isArray(r) && r.length > 0) rows = r;
+      if (m) meta = m;
+    } catch { /* ignore */ }
+  }
+  function clearState() {
+    try {
+      localStorage.removeItem(STORAGE_ROWS_KEY);
+      localStorage.removeItem(STORAGE_META_KEY);
+      sessionStorage.removeItem(STORAGE_ROWS_KEY);
+      sessionStorage.removeItem(STORAGE_META_KEY);
+    } catch {}
+  }
+
+  // Open labels in a NEW TAB and keep current page intact
+  function printLabels() {
+    persistState();
+    window.open('/labels', '_blank', 'noopener,noreferrer');
   }
 
   async function uploadAndExtract() {
@@ -92,6 +127,9 @@
       const data = JSON.parse(txt || '{}');
       rows = Array.isArray(data.rows) ? data.rows : [];
       meta = data.meta || null;
+
+      // Save immediately so Back / refresh / labels new tab all work
+      persistState();
     } catch (e: any) {
       error = e?.message ?? 'Network error';
     } finally {
@@ -148,6 +186,7 @@
 
   function resetAll() {
     file = null; rows = []; meta = null; error = ''; lastParserURL = ''; lastStatus = 0;
+    clearState();
   }
 
   // For label association a11y
@@ -187,7 +226,6 @@
   <header class="sticky top-0 z-30 border-b border-slate-200/60 bg-white/70 dark:bg-slate-950/60 backdrop-blur-md">
     <div class="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
       <div class="flex items-center gap-3">
-      <!--  <div class="h-8 w-8 rounded-xl bg-sky-600"></div> -->
         <div class="text-lg font-semibold tracking-tight">Inventory Filter</div>
       </div>
       <div class="flex items-center gap-2">
@@ -318,7 +356,7 @@
             <div class="ml-auto flex items-center gap-3">
               <button on:click={copyTSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Copy TSV</button>
               <button on:click={downloadCSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Download CSV</button>
-              <button on:click={printLabels} target="_blank" class="rounded-xl bg-sky-600 dark:bg-sky-600 text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
+              <button on:click={printLabels} class="rounded-xl bg-sky-600 dark:bg-sky-600 text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
             </div>
           {/if}
         </div>

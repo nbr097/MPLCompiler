@@ -2,23 +2,37 @@
   "name": "inventory-parser",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "dev": "vite dev",
+    "dev:vite": "vite dev",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dev:cf": "npm run build && wrangler pages dev .svelte-kit/cloudflare",
+    "deploy:cf": "wrangler pages deploy .svelte-kit/cloudflare",
+    "whoami": "wrangler whoami"
   },
   "dependencies": {
     "@sveltejs/kit": "latest",
+    "better-sqlite3": "^12.2.0",
     "openai": "^4.57.0",
+    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^4.10.38",
     "svelte": "latest"
   },
   "devDependencies": {
+    "@cloudflare/workerd-darwin-arm64": "^1.20250910.0",
     "@sveltejs/adapter-cloudflare": "latest",
+    "@tailwindcss/forms": "^0.5.8",
+    "autoprefixer": "^10.4.20",
+    "miniflare": "^4.20250906.0",
+    "postcss": "^8.4.40",
+    "tailwindcss": "^3.4.10",
     "typescript": "latest",
     "vite": "latest",
-    "tailwindcss": "^3.4.10",
-    "postcss": "^8.4.40",
-    "autoprefixer": "^10.4.20",
-    "@tailwindcss/forms": "^0.5.8"
+    "workerd": "^1.20250910.0",
+    "wrangler": "^4.35.0"
   }
 }

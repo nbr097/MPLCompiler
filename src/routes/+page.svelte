@@ -106,12 +106,77 @@
     window.open('/labels', '_blank', 'noopener,noreferrer');
   }
 
+// --- Store extraction from PDF (client-side using PDF.js) ---
+async function extractStoreFromPDF(file: File): Promise<{ store_number?: string; store_name?: string }> {
+  const pdfjsLib: any = await import('pdfjs-dist');
+  const workerUrl = (await import('pdfjs-dist/build/pdf.worker.mjs?url')).default as string;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+
+  const data = new Uint8Array(await file.arrayBuffer());
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+  const page = await pdf.getPage(1);
+  const viewport = page.getViewport({ scale: 1 });
+  const content = await page.getTextContent();
+
+  type Item = { str: string; transform: number[] };
+  const items = (content.items as Item[])
+    .map((it) => {
+      const [, , , , x, y] = it.transform; // e,f in transform
+      return { str: (it.str || '').trim(), x, y };
+    })
+    .filter((w) => w.str);
+
+  // Focus on the top-right box only (tight ROI to avoid header blob)
+  const topY = viewport.height * 0.86;  // top ~14%
+  const rightX = viewport.width * 0.62; // right ~38%
+  const roi = items
+    .filter((w) => w.y >= topY && w.x >= rightX)
+    .sort((a, b) => (b.y - a.y) || (a.x - b.x));
+
+  const text = roi.map((w) => w.str).join(' ').replace(/\s+/g, ' ').trim();
+
+  // Require a separator after the number to avoid article codes
+  // Allow 3–5 digit store numbers; capture 1–3 alphabetic words as name
+  const m = /(\d{3,5})\s*[\|:\-]\s*([A-Za-z][A-Za-z'.-]{1,24}(?:\s+[A-Za-z][A-Za-z'.-]{1,24}){0,2})\b/.exec(text);
+
+  if (m) {
+    const num = m[1];
+
+    // Clean the candidate name: stop at common header terms, keep at most 2 words
+    const stopTerms = new Set([
+      'Capacity','Capcity','Days','On','SIT','SOO','Std.','Std','Sell','Inventory','Sales','Last','Sold'
+    ]);
+    const tokens = m[2].split(/\s+/);
+    const clean: string[] = [];
+    for (const t of tokens) {
+      if (stopTerms.has(t)) break;
+      // skip tokens that look like numbers/dates accidentally included
+      if (/^\d|^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}$/.test(t)) break;
+      clean.push(t);
+      if (clean.length >= 2) break; // keep names short (e.g., "South Brisbane")
+    }
+    const name = clean.join(' ').trim();
+    if (name) return { store_number: num, store_name: name };
+  }
+
+  // Fallback: nothing solid found
+  return {};
+}
+
   async function uploadAndExtract() {
     if (!file) { error = 'Choose or drop a PDF first.'; return; }
     loading = true; error = ''; rows = []; meta = null; lastStatus = 0; lastParserURL = '';
 
     const fd = new FormData();
     fd.append('file', file);
+
+    // ⬇️ NEW: extract store fields client-side and include with the upload
+    try {
+      const store = await extractStoreFromPDF(file);
+      if (store.store_number) fd.append('store_number', store.store_number);
+      if (store.store_name)   fd.append('store_name', store.store_name);
+    } catch { /* best-effort only */ }
+
     const lp = (limitPages === '' ? 0 : Number(limitPages));
     fd.append('limit_pages', String(isFinite(lp) ? lp : 0));
 
@@ -228,6 +293,7 @@
       <div class="flex items-center gap-3">
         <div class="text-lg font-semibold tracking-tight">Inventory Filter</div>
       </div>
+      
       <div class="flex items-center gap-2">
         <button
           class="inline-flex items-center gap-2 rounded-lg border border-slate-300/70 dark:border-slate-700 bg-white/60 dark:bg-slate-900/60 px-3 py-1.5 text-sm hover:bg-white dark:hover:bg-slate-900"
@@ -237,11 +303,15 @@
             {#if dark}
               <path d="M21.64 13A9 9 0 0 1 12 3a9 9 0 1 0 9.64 10z"/>
             {:else}
-              <path d="M12 4a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V5a1 1 0 0 1 1-1Zm0 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8-5h2a1 1 0 1 1 0 2h-2a1 1 0 1 1 0-2ZM2 11h2a1 1 0 1 1 0 2H2a1 1 0 1 1 0-2Zm14.95 6.536 1.414 1.414a1 1 0 1 1-1.414 1.414l-1.414-1.414a1 1 0 0 1 1.414-1.414ZM6.05 5.464 4.636 4.05A1 1 0 0 1 6.05 2.636L7.464 4.05A1 1 0 1 1 6.05 5.464Zm0 13.072L4.636 19.95a1 1 0 0 0 1.414 1.414l1.414-1.414A1 1 0 1 0 6.05 18.536Zm11.313-13.072a1 1 0 1 0-1.414-1.414L14.536 5.464A1 1 0 1 0 15.95 6.878l1.414-1.414Z"/>
+              <path d="M12 4a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V5a 1 1 0 0 1 1-1Zm0 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8-5h2a1 1 0 1 1 0 2h-2a1 1 0 1 1 0-2ZM2 11h2a1 1 0 1 1 0 2H2a1 1 0 1 1 0-2Zm14.95 6.536 1.414 1.414a1 1 0 1 1-1.414 1.414l-1.414-1.414a1 1 0 0 1 1.414-1.414ZM6.05 5.464 4.636 4.05A1 1 0 0 1 6.05 2.636L7.464 4.05A1 1 0 1 1 6.05 5.464Zm0 13.072L4.636 19.95a1 1 0 0 0 1.414 1.414l1.414-1.414A1 1 0 1 0 6.05 18.536Zm11.313-13.072a1 1 0 1 0-1.414-1.414L14.536 5.464A1 1 0 1 0 15.95 6.878l1.414-1.414Z"/>
             {/if}
           </svg>
           <span class="hidden sm:inline">{dark ? 'Dark' : 'Light'}</span>
         </button>
+        <a href="/admin"
+          class="inline-flex items-center gap-2 rounded-lg border border-slate-300/70 dark:border-slate-700 bg-white/60 dark:bg-slate-900/60 px-3 py-1.5 text-sm hover:bg-white dark:hover:bg-slate-900">
+          Admin
+        </a>
       </div>
     </div>
   </header>
@@ -275,17 +345,6 @@
                   <input id={fileInputId} class="absolute inset-0 opacity-0 cursor-pointer" type="file" accept=".pdf" on:change={onFileInput} />
                 </label>
               </div>
-
-              <!-- Options
-              <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div class="sm:col-span-1">
-                  <label for={pagesInputId} class="block text-sm font-medium text-slate-700 dark:text-slate-300">Pages to scan</label>
-                  <input id={pagesInputId} type="number" min="0" step="1" bind:value={limitPages}
-                    class="mt-1 block w-full rounded-xl border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:border-sky-500 focus:ring-sky-500 px-3 py-2"
-                    placeholder="0 = all" />
-                </div>
-              </div>
- -->
 
               <!-- Actions -->
               <div class="flex flex-wrap items-center gap-3 pt-2">
@@ -355,8 +414,6 @@
           <h2 class="text-lg font-semibold">Results</h2>
           {#if rows.length}
             <div class="ml-auto flex items-center gap-3">
-             <!-- <button on:click={copyTSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Copy TSV</button> -->
-             <!-- <button on:click={downloadCSV} class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">Download CSV</button> -->
               <button on:click={printLabels} class="rounded-xl bg-sky-600 dark:bg-sky-600 text-white px-3 py-2 text-sm hover:opacity-90">Print labels</button>
             </div>
           {/if}
@@ -403,7 +460,6 @@
         {#if meta}
 <!--
           <div>Parsed with modes: {meta.mode_used?.join(', ')}</div>
-
 -->
         {/if}
       </div>

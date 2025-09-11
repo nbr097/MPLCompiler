@@ -106,62 +106,107 @@
     window.open('/labels', '_blank', 'noopener,noreferrer');
   }
 
-// --- Store extraction from PDF (client-side using PDF.js) ---
-async function extractStoreFromPDF(file: File): Promise<{ store_number?: string; store_name?: string }> {
-  const pdfjsLib: any = await import('pdfjs-dist');
-  const workerUrl = (await import('pdfjs-dist/build/pdf.worker.mjs?url')).default as string;
-  pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+  // --- Robust store extraction from PDF (client-side using PDF.js) ---
+  async function extractStoreFromPDF(file: File): Promise<{ store_number?: string; store_name?: string }> {
+    const pdfjsLib: any = await import('pdfjs-dist');
+    // pdfjs-dist v4 ships an ESM worker; the ?url import yields the built asset URL
+    const workerUrl = (await import('pdfjs-dist/build/pdf.worker.mjs?url')).default as string;
+    pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
-  const data = new Uint8Array(await file.arrayBuffer());
-  const pdf = await pdfjsLib.getDocument({ data }).promise;
-  const page = await pdf.getPage(1);
-  const viewport = page.getViewport({ scale: 1 });
-  const content = await page.getTextContent();
+    const data = new Uint8Array(await file.arrayBuffer());
+    const pdf = await pdfjsLib.getDocument({ data }).promise;
+    const page = await pdf.getPage(1);
+    const viewport = page.getViewport({ scale: 1 });
+    const content = await page.getTextContent();
 
-  type Item = { str: string; transform: number[] };
-  const items = (content.items as Item[])
-    .map((it) => {
-      const [, , , , x, y] = it.transform; // e,f in transform
-      return { str: (it.str || '').trim(), x, y };
-    })
-    .filter((w) => w.str);
+    type Item = { str: string; transform: number[] };
+    const items = (content.items as Item[])
+      .map((it) => {
+        const [, , , , x, y] = it.transform; // e,f
+        return { str: (it.str || '').trim(), x, y };
+      })
+      .filter((w) => w.str);
 
-  // Focus on the top-right box only (tight ROI to avoid header blob)
-  const topY = viewport.height * 0.86;  // top ~14%
-  const rightX = viewport.width * 0.62; // right ~38%
-  const roi = items
-    .filter((w) => w.y >= topY && w.x >= rightX)
-    .sort((a, b) => (b.y - a.y) || (a.x - b.x));
+    // If the PDF is scanned (no text layer), we can't extract on the client
+    if (!items.length) return {};
 
-  const text = roi.map((w) => w.str).join(' ').replace(/\s+/g, ' ').trim();
+    // ---- Find the table header Y so we can ignore everything below it ----
+    const headerHints = new Set(['Article', 'Description', 'UOM', 'SOH', 'MPL', 'Inventory', 'Sales', 'Last', 'Sold']);
+    const headerYs = items.filter((w) => headerHints.has(w.str)).map((w) => w.y);
+    const tableHeaderY = headerYs.length ? Math.min(...headerYs) : viewport.height * 0.60; // conservative
 
-  // Require a separator after the number to avoid article codes
-  // Allow 3–5 digit store numbers; capture 1–3 alphabetic words as name
-  const m = /(\d{3,5})\s*[\|:\-]\s*([A-Za-z][A-Za-z'.-]{1,24}(?:\s+[A-Za-z][A-Za-z'.-]{1,24}){0,2})\b/.exec(text);
+    // ---- Build lines (group by Y with tolerance) ----
+    const tol = Math.max(2, viewport.height * 0.003);
+    const sorted = items.sort((a, b) => b.y - a.y || a.x - b.x); // top→bottom, left→right
+    const lines: { y: number; words: { str: string; x: number; y: number }[] }[] = [];
+    for (const w of sorted) {
+      const L = lines.find((ln) => Math.abs(ln.y - w.y) <= tol);
+      if (L) L.words.push(w);
+      else lines.push({ y: w.y, words: [w] });
+    }
+    lines.forEach((L) => L.words.sort((a, b) => a.x - b.x));
 
-  if (m) {
-    const num = m[1];
+    // ---- Limit to a *top-right* ROI and above the table header ----
+    const rightX = viewport.width * 0.50;  // right half (wider than before)
+    const topY   = viewport.height * 0.75; // top 25% (wider than before)
+    const roiLines = lines.filter((L) => {
+      const minX = Math.min(...L.words.map((w) => w.x));
+      const maxX = Math.max(...L.words.map((w) => w.x));
+      return L.y >= topY && L.y >= tableHeaderY + 8 && (maxX >= rightX || minX >= rightX);
+    });
 
-    // Clean the candidate name: stop at common header terms, keep at most 2 words
+    const sepRe = /^[\|\:\-]$/;
+    const storeNumRe = /^\d{3,6}$/;
     const stopTerms = new Set([
       'Capacity','Capcity','Days','On','SIT','SOO','Std.','Std','Sell','Inventory','Sales','Last','Sold'
     ]);
-    const tokens = m[2].split(/\s+/);
-    const clean: string[] = [];
-    for (const t of tokens) {
-      if (stopTerms.has(t)) break;
-      // skip tokens that look like numbers/dates accidentally included
-      if (/^\d|^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}$/.test(t)) break;
-      clean.push(t);
-      if (clean.length >= 2) break; // keep names short (e.g., "South Brisbane")
-    }
-    const name = clean.join(' ').trim();
-    if (name) return { store_number: num, store_name: name };
-  }
+    const dateWordRe = /^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}$/;
 
-  // Fallback: nothing solid found
-  return {};
-}
+    // Pass 1: same-line "1234 | Name" pattern
+    for (const L of roiLines) {
+      const numIdx = L.words.findIndex((w) => storeNumRe.test(w.str));
+      if (numIdx === -1) continue;
+
+      // demand a separator after the number
+      let j = numIdx + 1;
+      if (j < L.words.length && sepRe.test(L.words[j].str)) j++;
+      else continue; // no separator → likely not the header block
+
+      // gather 1–3 tokens as name, stopping at header-ish words/dates/numbers
+      const nameTokens: string[] = [];
+      for (; j < L.words.length; j++) {
+        const t = L.words[j].str;
+        if (stopTerms.has(t)) break;
+        if (dateWordRe.test(t)) break;
+        if (/^\d/.test(t)) break; // numbers are not part of the name
+        nameTokens.push(t);
+        if (nameTokens.length >= 3) break;
+      }
+      const candidate = nameTokens.join(' ').replace(/\s+/g, ' ').trim();
+      if (candidate) {
+        return { store_number: L.words[numIdx].str, store_name: candidate };
+      }
+    }
+
+    // Pass 2: if a number is present in the ROI but no separator/name, accept the number only
+    for (const L of roiLines) {
+      const num = L.words.find((w) => storeNumRe.test(w.str));
+      if (num) return { store_number: num.str, store_name: '' };
+    }
+
+    // Pass 3 (fallback): global text with explicit "1234 | Name" pattern above header
+    const topText = items
+      .filter((w) => w.y >= tableHeaderY + 8) // only above header
+      .sort((a, b) => (b.y - a.y) || (a.x - b.x))
+      .map((w) => w.str)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const m = /(\d{3,6})\s*[\|:\-]\s*([A-Za-z][A-Za-z'.-]{1,24}(?:\s+[A-Za-z][A-Za-z'.-]{1,24}){0,2})\b/.exec(topText);
+    if (m) return { store_number: m[1], store_name: m[2] };
+
+    return {};
+  }
 
   async function uploadAndExtract() {
     if (!file) { error = 'Choose or drop a PDF first.'; return; }
@@ -170,7 +215,7 @@ async function extractStoreFromPDF(file: File): Promise<{ store_number?: string;
     const fd = new FormData();
     fd.append('file', file);
 
-    // ⬇️ NEW: extract store fields client-side and include with the upload
+    // ⬇️ extract store fields client-side and include with the upload
     try {
       const store = await extractStoreFromPDF(file);
       if (store.store_number) fd.append('store_number', store.store_number);
@@ -200,23 +245,6 @@ async function extractStoreFromPDF(file: File): Promise<{ store_number?: string;
     } finally {
       loading = false;
     }
-  }
-
-  function copyTSV() {
-    const header = 'Article\tDescription\tSOH\tMPL';
-    const body = rows.map(r => `${r.article}\t${r.description}\t${r.soh}\t${r.mpl}`).join('\n');
-    navigator.clipboard.writeText([header, body].join('\n'));
-  }
-
-  function downloadCSV() {
-    const header = 'Article,Description,SOH,MPL';
-    const esc = (s: string) => `"${(s || '').replace(/"/g, '""')}"`;
-    const body = rows.map(r => [r.article, r.description, r.soh, r.mpl].map(v => esc(String(v))).join(',')).join('\n');
-    const blob = new Blob([header + '\n' + body], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'soh_le_mpl.csv'; a.click();
-    URL.revokeObjectURL(url);
   }
 
   function onFileInput(e: Event) {
@@ -303,7 +331,7 @@ async function extractStoreFromPDF(file: File): Promise<{ store_number?: string;
             {#if dark}
               <path d="M21.64 13A9 9 0 0 1 12 3a9 9 0 1 0 9.64 10z"/>
             {:else}
-              <path d="M12 4a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V5a 1 1 0 0 1 1-1Zm0 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8-5h2a1 1 0 1 1 0 2h-2a1 1 0 1 1 0-2ZM2 11h2a1 1 0 1 1 0 2H2a1 1 0 1 1 0-2Zm14.95 6.536 1.414 1.414a1 1 0 1 1-1.414 1.414l-1.414-1.414a1 1 0 0 1 1.414-1.414ZM6.05 5.464 4.636 4.05A1 1 0 0 1 6.05 2.636L7.464 4.05A1 1 0 1 1 6.05 5.464Zm0 13.072L4.636 19.95a1 1 0 0 0 1.414 1.414l1.414-1.414A1 1 0 1 0 6.05 18.536Zm11.313-13.072a1 1 0 1 0-1.414-1.414L14.536 5.464A1 1 0 1 0 15.95 6.878l1.414-1.414Z"/>
+              <path d="M12 4a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V5a1 1 0 0 1 1-1Zm0 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm8-5h2a1 1 0 1 1 0 2h-2a1 1 0 1 1 0-2ZM2 11h2a1 1 0 1 1 0 2H2a1 1 0 1 1 0-2Zm14.95 6.536 1.414 1.414a1 1 0 1 1-1.414 1.414l-1.414-1.414a1 1 0 0 1 1.414-1.414ZM6.05 5.464 4.636 4.05A1 1 0 0 1 6.05 2.636L7.464 4.05A1 1 0 1 1 6.05 5.464Zm0 13.072L4.636 19.95a1 1 0 0 0 1.414 1.414l1.414-1.414A1 1 0 1 0 6.05 18.536Zm11.313-13.072a1 1 0 1 0-1.414-1.414L14.536 5.464A1 1 0 1 0 15.95 6.878l1.414-1.414Z"/>
             {/if}
           </svg>
           <span class="hidden sm:inline">{dark ? 'Dark' : 'Light'}</span>

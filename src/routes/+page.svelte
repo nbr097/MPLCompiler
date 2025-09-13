@@ -26,6 +26,9 @@
   let dragging = false;
   let dragCounter = 0;
 
+  // SVG support
+  let svgSupported = true;
+
   // theme
   let dark = false;
   onMount(() => {
@@ -36,17 +39,33 @@
     // Restore previously extracted data so Back/reload shows the same table
     restoreState();
 
+    // detect SVG support
+    svgSupported = !!document.createElementNS?.('http://www.w3.org/2000/svg', 'svg').createSVGRect;
+
+    // hooks
     window.addEventListener('dragover', onDragOver);
     window.addEventListener('dragenter', onDragEnter);
     window.addEventListener('dragleave', onDragLeave);
     window.addEventListener('drop', onDrop);
+
+    // re-render SVG on layout changes / before print
+    const rerender = () => renderAll();
+    window.addEventListener('resize', rerender);
+    window.addEventListener('beforeprint', rerender);
+
+    // initial paint (after DOM)
+    queueMicrotask(renderAll);
+
+    onDestroy(() => {
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragenter', onDragEnter);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+      window.removeEventListener('resize', rerender);
+      window.removeEventListener('beforeprint', rerender);
+    });
   });
-  onDestroy(() => {
-    window.removeEventListener('dragover', onDragOver);
-    window.removeEventListener('dragenter', onDragEnter);
-    window.removeEventListener('dragleave', onDragLeave);
-    window.removeEventListener('drop', onDrop);
-  });
+
   function applyTheme() {
     const root = document.documentElement;
     root.classList.toggle('dark', dark);
@@ -62,34 +81,6 @@
         setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
       )
     ]);
-  }
-
-  // ----- Code 39 helpers -----
-  const CODE39_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%';
-  const CODE39_VALUES: Record<string, number> = (() => {
-    const map: Record<string, number> = {};
-    for (let i = 0; i < CODE39_ALPHABET.length; i++) map[CODE39_ALPHABET[i]] = i;
-    return map;
-  })();
-
-  // Clean to valid Code39 (uppercase + allowed chars). Returns only digits/letters if others present.
-  function sanitizeForCode39(input: string | number) {
-    const s = String(input ?? '').toUpperCase();
-    const out = [...s].filter((ch) => CODE39_VALUES[ch] !== undefined);
-    return out.join('');
-  }
-  function code39Checksum(data: string) {
-    // Mod-43 checksum (optional). Some scanners may expect it.
-    const sum = [...data].reduce((acc, ch) => acc + (CODE39_VALUES[ch] ?? 0), 0);
-    const idx = sum % 43;
-    return CODE39_ALPHABET[idx];
-  }
-  // Guarded Code 39 string: wrap in asterisks; optionally include checksum before the closing '*'
-  const USE_CODE39_CHECKSUM = false; // set true if your scanners expect a checksum
-  function toCode39(value: string | number) {
-    const body = sanitizeForCode39(value);
-    const payload = USE_CODE39_CHECKSUM ? body + code39Checksum(body) : body;
-    return `*${payload}*`;
   }
 
   // Persist rows/meta to storage (both local & session for flexibility)
@@ -131,7 +122,6 @@
   // --- Robust store extraction from PDF (client-side using PDF.js) ---
   async function extractStoreFromPDF(file: File): Promise<{ store_number?: string; store_name?: string }> {
     const pdfjsLib: any = await import('pdfjs-dist');
-    // pdfjs-dist v4 ships an ESM worker; the ?url import yields the built asset URL
     const workerUrl = (await import('pdfjs-dist/build/pdf.worker.mjs?url')).default as string;
     pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -149,17 +139,14 @@
       })
       .filter((w) => w.str);
 
-    // If the PDF is scanned (no text layer), we can't extract on the client
     if (!items.length) return {};
 
-    // ---- Find the table header Y so we can ignore everything below it ----
     const headerHints = new Set(['Article', 'Description', 'UOM', 'SOH', 'MPL', 'Inventory', 'Sales', 'Last', 'Sold']);
     const headerYs = items.filter((w) => headerHints.has(w.str)).map((w) => w.y);
-    const tableHeaderY = headerYs.length ? Math.min(...headerYs) : viewport.height * 0.60; // conservative
+    const tableHeaderY = headerYs.length ? Math.min(...headerYs) : viewport.height * 0.60;
 
-    // ---- Build lines (group by Y with tolerance) ----
     const tol = Math.max(2, viewport.height * 0.003);
-    const sorted = items.sort((a, b) => b.y - a.y || a.x - b.x); // top→bottom, left→right
+    const sorted = items.sort((a, b) => b.y - a.y || a.x - b.x);
     const lines: { y: number; words: { str: string; x: number; y: number }[] }[] = [];
     for (const w of sorted) {
       const L = lines.find((ln) => Math.abs(ln.y - w.y) <= tol);
@@ -168,9 +155,8 @@
     }
     lines.forEach((L) => L.words.sort((a, b) => a.x - b.x));
 
-    // ---- Limit to a *top-right* ROI and above the table header ----
-    const rightX = viewport.width * 0.50;  // right half (wider than before)
-    const topY   = viewport.height * 0.75; // top 25% (wider than before)
+    const rightX = viewport.width * 0.50;
+    const topY   = viewport.height * 0.75;
     const roiLines = lines.filter((L) => {
       const minX = Math.min(...L.words.map((w) => w.x));
       const maxX = Math.max(...L.words.map((w) => w.x));
@@ -184,23 +170,20 @@
     ]);
     const dateWordRe = /^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}$/;
 
-    // Pass 1: same-line "1234 | Name" pattern
     for (const L of roiLines) {
       const numIdx = L.words.findIndex((w) => storeNumRe.test(w.str));
       if (numIdx === -1) continue;
 
-      // demand a separator after the number
       let j = numIdx + 1;
       if (j < L.words.length && sepRe.test(L.words[j].str)) j++;
-      else continue; // no separator → likely not the header block
+      else continue;
 
-      // gather 1–3 tokens as name, stopping at header-ish words/dates/numbers
       const nameTokens: string[] = [];
       for (; j < L.words.length; j++) {
         const t = L.words[j].str;
         if (stopTerms.has(t)) break;
         if (dateWordRe.test(t)) break;
-        if (/^\d/.test(t)) break; // numbers are not part of the name
+        if (/^\d/.test(t)) break;
         nameTokens.push(t);
         if (nameTokens.length >= 3) break;
       }
@@ -210,15 +193,13 @@
       }
     }
 
-    // Pass 2: if a number is present in the ROI but no separator/name, accept the number only
     for (const L of roiLines) {
       const num = L.words.find((w) => storeNumRe.test(w.str));
       if (num) return { store_number: num.str, store_name: '' };
     }
 
-    // Pass 3 (fallback): global text with explicit "1234 | Name" pattern above header
     const topText = items
-      .filter((w) => w.y >= tableHeaderY + 8) // only above header
+      .filter((w) => w.y >= tableHeaderY + 8)
       .sort((a, b) => (b.y - a.y) || (a.x - b.x))
       .map((w) => w.str)
       .join(' ')
@@ -237,7 +218,7 @@
     const fd = new FormData();
     fd.append('file', file);
 
-    // ⬇️ extract store fields client-side and include with the upload
+    // include client-side store hints if available
     try {
       const store = await extractStoreFromPDF(file);
       if (store.store_number) fd.append('store_number', store.store_number);
@@ -260,8 +241,8 @@
       rows = Array.isArray(data.rows) ? data.rows : [];
       meta = data.meta || null;
 
-      // Save immediately so Back / refresh / labels new tab all work
       persistState();
+      queueMicrotask(renderAll); // paint SVG after DOM updates
     } catch (e: any) {
       error = e?.message ?? 'Network error';
     } finally {
@@ -302,50 +283,177 @@
   function resetAll() {
     file = null; rows = []; meta = null; error = ''; lastParserURL = ''; lastStatus = 0;
     clearState();
+    queueMicrotask(renderAll);
   }
 
   // For label association a11y
   const fileInputId = 'pdf-file-input';
   const pagesInputId = 'pages-input';
+
+  /* ---------------- Code 39 (SVG) ---------------- */
+
+  // Allowed characters in Code39
+  const ALLOWED = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%".split("");
+
+  // n = narrow, w = wide (9 elements, 3 wide). Patterns start with a bar.
+  const C39: Record<string, string> = {
+    '0': 'nnnwwnwnn', '1': 'wnnwnnnnw', '2': 'nnwwnnnnw', '3': 'wnwwnnnnn',
+    '4': 'nnnwwnnnw', '5': 'wnnwwnnnn', '6': 'nnwwwnnnn', '7': 'nnnwnnwnw',
+    '8': 'wnnwnnwnn', '9': 'nnwwnnwnn', 'A': 'wnnnnwnnw', 'B': 'nnwnnwnnw',
+    'C': 'wnwnnwnnn', 'D': 'nnnnwwnnw', 'E': 'wnnnwwnnn', 'F': 'nnwnwwnnn',
+    'G': 'nnnnnwwnw', 'H': 'wnnnnwwnn', 'I': 'nnwnnwwnn', 'J': 'nnnnwwwnn',
+    'K': 'wnnnnnnww', 'L': 'nnwnnnnww', 'M': 'wnwnnnnwn', 'N': 'nnnnwnnww',
+    'O': 'wnnnwnnwn', 'P': 'nnwnwnnwn', 'Q': 'nnnnnnwww', 'R': 'wnnnnnwwn',
+    'S': 'nnwnnnwwn', 'T': 'nnnnwnwwn', 'U': 'wwnnnnnnw', 'V': 'nwwnnnnnw',
+    'W': 'wwwnnnnnn', 'X': 'nwnnwnnnw', 'Y': 'wwnnwnnnn', 'Z': 'nwwnwnnnn',
+    '-': 'nwnnnnwnw', '.': 'wwnnnnwnn', ' ': 'nwwnnnwnn', '$': 'nwnwnwnnn',
+    '/': 'nwnwnnnwn', '+': 'nwnnnwnwn', '%': 'nnnwnwnwn', '*': 'nwnnwnwnn'
+  };
+
+  function sanitizeData(val: string | number) {
+    const s = String(val ?? '').toUpperCase().trim();
+    return [...s].filter((ch) => ALLOWED.includes(ch)).join('');
+  }
+  const withGuards = (s: string) => `*${s}*`;
+
+  // Build bar/space runs; includes quiet zones (10 narrow units each side)
+  function buildRuns(data: string): { isBar: boolean; units: number }[] {
+    const runs: { isBar: boolean; units: number }[] = [];
+    const push = (isBar: boolean, units: number) => {
+      if (units <= 0) return;
+      const last = runs[runs.length - 1];
+      if (last && last.isBar === isBar) last.units += units;
+      else runs.push({ isBar, units });
+    };
+
+    // quiet left
+    push(false, 10);
+
+    const chars = [...data];
+    chars.forEach((ch, idx) => {
+      const pat = C39[ch];
+      if (!pat) return;
+      let isBar = true;
+      for (const token of pat) {
+        push(isBar, token === 'w' ? 3 : 1);
+        isBar = !isBar;
+      }
+      if (idx < chars.length - 1) push(false, 1); // inter-char gap
+    });
+
+    // quiet right
+    push(false, 10);
+    return runs;
+  }
+
+  // Render all barcodes currently in the table
+  function renderAll() {
+    if (!svgSupported) return;
+    const hosts = document.querySelectorAll<HTMLElement>('.barcode-host');
+    const tds = document.querySelectorAll<HTMLElement>('td');
+
+    rows.forEach((r, i) => {
+      renderIntoHost(r.article, hosts[i] || null, tds[i * 4] || null); // first column td approx
+    });
+  }
+
+// Render one into a host <div> (narrower + shorter)
+function renderIntoHost(article: string, host: HTMLElement | null, containerHint?: HTMLElement | null) {
+  if (!host) return;
+
+  const container = (host.parentElement?.closest('td') as HTMLElement) || containerHint || host;
+
+  // --- size controls ---
+  const pad = 6;
+  const WIDTH_FACTOR = 0.85;   // ← make it narrower by using 60% of the cell width
+  const MIN_W = 120;
+  const MAX_W = 360;
+
+  const raw = (container.clientWidth || 260) - pad * 2;
+  const width = Math.max(MIN_W, Math.min(raw * WIDTH_FACTOR, MAX_W));
+
+  // shorter height (proportional to width, clamped)
+  const HEIGHT_FACTOR = 0.10;
+  const MIN_H = 22;
+  const MAX_H = 40;
+  const height = Math.min(MAX_H, Math.max(MIN_H, Math.round(width * HEIGHT_FACTOR)));
+
+  const dataText = sanitizeData(article);
+  const data = withGuards(dataText);
+  const runs = buildRuns(data);
+
+  const totalUnits = runs.reduce((a, r) => a + r.units, 0);
+  const modulePx = Math.max(1, Math.floor(width / totalUnits)); // keep bars crisp
+  const barcodeW = Math.max(1, Math.round(modulePx * totalUnits));
+
+  host.innerHTML = '';
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', String(barcodeW));
+  svg.setAttribute('height', String(height));
+  svg.setAttribute('viewBox', `0 0 ${barcodeW} ${height}`);
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+  svg.classList.add('text-black', 'dark:text-white');
+
+  let x = 0;
+  for (const r of runs) {
+    const wpx = r.units * modulePx;
+    if (r.isBar) {
+      const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      rect.setAttribute('x', String(x));
+      rect.setAttribute('y', '0');
+      rect.setAttribute('width', String(wpx));
+      rect.setAttribute('height', String(height));
+      rect.setAttribute('fill', 'currentColor');
+      svg.appendChild(rect);
+    }
+    x += wpx;
+  }
+  host.appendChild(svg);
+}
+
+
+
+  // Re-render when the row count changes (DOM will re-create hosts)
+  $: if (svgSupported) {
+    void rows.length;
+    queueMicrotask(renderAll);
+  }
 </script>
 
 <svelte:head>
-  <!-- Libre Barcode 39 font for Code 39 barcodes -->
+  <!-- Libre Barcode 39 font for fallback (if SVG unsupported) -->
   <link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+39&display=swap" rel="stylesheet" />
   <style>
-    /* Always render scannable: black on white, quiet zones, no scaling */
-    .barcode-wrap {
-      display: inline-block;
-      background: #fff;        /* keep light background even in dark mode */
-      padding: 0 12px;         /* quiet zone on screen */
-      white-space: nowrap;
-      border: 1px solid transparent; /* prevents some printers from clipping edges */
-    }
     .barcode39 {
       font-family: 'Libre Barcode 39', cursive;
-      font-weight: 400;        /* never bold */
-      color: #000 !important;  /* dark bars */
       line-height: 1;
       letter-spacing: 0;
-      font-size: 42px;         /* table size; labels page can render larger */
+      font-size: 42px;
       white-space: nowrap;
-      -webkit-font-smoothing: antialiased;
-      -moz-osx-font-smoothing: grayscale;
     }
-    @media (prefers-color-scheme: dark) {
-      .barcode-wrap { background: #fff; } /* override dark backgrounds */
+
+    /* --- Toolbar select arrow fix (same as labels page) --- */
+    .toolbar {
+      --arrow: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23334155' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
     }
-    @media print {
-      .barcode-wrap {
-        background: #fff !important;
-        padding-left: 0.20in;   /* recommended Code39 quiet zone ≈ 10× narrow bar */
-        padding-right: 0.20in;
-      }
-      .barcode39 {
-        color: #000 !important;
-        -webkit-print-color-adjust: exact;
-        print-color-adjust: exact;
-      }
+    .toolbar select {
+      -webkit-appearance: none;
+      appearance: none;
+      background-image: var(--arrow);
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      background-size: 12px;
+      padding-right: 32px;
+      min-height: 36px;
+      line-height: 1.2;
+      border-radius: 10px;
+    }
+    .toolbar label {
+      display: inline-flex;
+      align-items: center;
+      min-height: 36px;
+      font-size: 14px;
     }
   </style>
 </svelte:head>
@@ -365,11 +473,11 @@
 
   <!-- Header -->
   <header class="sticky top-0 z-30 border-b border-slate-200/60 bg-white/70 dark:bg-slate-950/60 backdrop-blur-md">
-    <div class="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
+    <div class="toolbar mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
       <div class="flex items-center gap-3">
         <div class="text-lg font-semibold tracking-tight">Inventory Filter</div>
       </div>
-      
+
       <div class="flex items-center gap-2">
         <button
           class="inline-flex items-center gap-2 rounded-lg border border-slate-300/70 dark:border-slate-700 bg-white/60 dark:bg-slate-900/60 px-3 py-1.5 text-sm hover:bg-white dark:hover:bg-slate-900"
@@ -400,9 +508,7 @@
         <div class="md:col-span-3">
           <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/70 p-6 shadow-sm">
             <h1 class="text-2xl font-bold tracking-tight">Upload your report</h1>
-            <p class="mt-1 text-slate-600 dark:text-slate-400">
-              Drop a PDF anywhere, or choose a file. We’ll extract rows where <span class="font-semibold">SOH ≤ MPL</span>.
-            </p>
+            <p class="mt-1 text-slate-600 dark:text-slate-400">Drop a PDF anywhere, or choose a file. We’ll extract rows where <span class="font-semibold">SOH ≤ MPL</span>.</p>
 
             <div class="mt-5 space-y-5">
 
@@ -498,7 +604,7 @@
         </div>
 
         {#if !loading && !error && rows.length === 0}
-          <div class="mt-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 p-4 text-slate-700 dark:text-slate-300">
+          <div class="mt-4 rounded-XL border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 p-4 text-slate-700 dark:text-slate-300">
             No rows matched (SOH ≤ MPL). Try scanning more pages (set to <span class="font-semibold">0</span> to scan the whole PDF).
           </div>
         {/if}
@@ -515,13 +621,19 @@
                 </tr>
               </thead>
               <tbody class="[&>tr:nth-child(odd)]:bg-white [&>tr:nth-child(even)]:bg-slate-50 dark:[&>tr:nth-child(odd)]:bg-slate-900/60 dark:[&>tr:nth-child(even)]:bg-slate-900/30">
-                {#each rows as r}
+                {#each rows as r, i}
                   <tr class="border-t border-slate-200 dark:border-slate-800 align-top">
                     <td class="px-4 py-2 tabular-nums">
                       <div class="font-medium">{r.article}</div>
-                      <div class="barcode-wrap mt-1">
-                        <span class="barcode39">{toCode39(r.article)}</span>
-                      </div>
+
+                      <!-- SVG barcode (fallback to font if unsupported) -->
+                      {#if svgSupported}
+                        <div class="mt-1 flex justify-start">
+                          <div class="barcode-host text-black dark:text-white" data-i={i} />
+                        </div>
+                      {:else}
+                        <div class="barcode39 text-black dark:text-white mt-1">{'*' + String(r.article).trim() + '*'}</div>
+                      {/if}
                     </td>
                     <td class="px-4 py-2">{r.description}</td>
                     <td class="px-4 py-2 tabular-nums">{r.soh}</td>

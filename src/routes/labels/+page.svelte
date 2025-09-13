@@ -1,195 +1,289 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { goto } from '$app/navigation';
-  import { tick } from 'svelte';
 
-  type Row = {
-    article: string | number;
-    description?: string;
-    soh?: number;
-    mpl?: number;
-    [k: string]: any;
+  type Row = { article: string; description: string; soh: number; mpl: number };
+
+  // UI/state
+  let rows: Row[] = [];
+  let error = '';
+  let columns: number = 3;
+  let mode: 'svg' | 'font' = 'svg';
+  let svgSupported = true;
+
+  // Smart back behavior for new-tab vs in-app nav
+  function smartBack() {
+    // If opened by script and there's no meaningful history, try to close
+    if ((window.opener || window.opener === null) && history.length <= 1) {
+      try { window.close(); return; } catch {}
+    }
+    // If we came from same origin, go back
+    try {
+      const ref = document.referrer ? new URL(document.referrer) : null;
+      if (ref && ref.origin === location.origin) {
+        history.back();
+        return;
+      }
+    } catch {}
+    // Fallback: go home
+    location.href = '/';
+  }
+
+  // Read rows saved by the main page
+  onMount(() => {
+    try {
+      const raw = sessionStorage.getItem('mpl_rows_v1') || localStorage.getItem('mpl_rows_v1');
+      rows = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(rows) || rows.length === 0) {
+        error = 'No rows found. Go back and run an extract first.';
+      }
+    } catch {
+      error = 'Could not read saved rows.';
+    }
+
+    svgSupported = !!document.createElementNS?.('http://www.w3.org/2000/svg', 'svg').createSVGRect;
+
+    // initial paint
+    queueMicrotask(renderAll);
+
+    const rerender = () => renderAll();
+    window.addEventListener('resize', rerender);
+    window.addEventListener('beforeprint', rerender);
+    return () => {
+      window.removeEventListener('resize', rerender);
+      window.removeEventListener('beforeprint', rerender);
+    };
+  });
+
+  // Re-render when relevant inputs change
+  $: if (mode === 'svg' && svgSupported) {
+    // re-run whenever these change
+    void columns; void rows.length;
+    renderAll();
+  }
+
+  /* ---------------- Code 39 (SVG) ---------------- */
+
+  // Allowed characters in Code39
+  const ALLOWED = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%".split("");
+
+  // n = narrow, w = wide (9 elements, 3 wide). Patterns start with a bar.
+  const C39: Record<string, string> = {
+    '0': 'nnnwwnwnn', '1': 'wnnwnnnnw', '2': 'nnwwnnnnw', '3': 'wnwwnnnnn',
+    '4': 'nnnwwnnnw', '5': 'wnnwwnnnn', '6': 'nnwwwnnnn', '7': 'nnnwnnwnw',
+    '8': 'wnnwnnwnn', '9': 'nnwwnnwnn', 'A': 'wnnnnwnnw', 'B': 'nnwnnwnnw',
+    'C': 'wnwnnwnnn', 'D': 'nnnnwwnnw', 'E': 'wnnnwwnnn', 'F': 'nnwnwwnnn',
+    'G': 'nnnnnwwnw', 'H': 'wnnnnwwnn', 'I': 'nnwnnwwnn', 'J': 'nnnnwwwnn',
+    'K': 'wnnnnnnww', 'L': 'nnwnnnnww', 'M': 'wnwnnnnwn', 'N': 'nnnnwnnww',
+    'O': 'wnnnwnnwn', 'P': 'nnwnwnnwn', 'Q': 'nnnnnnwww', 'R': 'wnnnnnwwn',
+    'S': 'nnwnnnwwn', 'T': 'nnnnwnwwn', 'U': 'wwnnnnnnw', 'V': 'nwwnnnnnw',
+    'W': 'wwwnnnnnn', 'X': 'nwnnwnnnw', 'Y': 'wwnnwnnnn', 'Z': 'nwwnwnnnn',
+    '-': 'nwnnnnwnw', '.': 'wwnnnnwnn', ' ': 'nwwnnnwnn', '$': 'nwnwnwnnn',
+    '/': 'nwnwnnnwn', '+': 'nwnnnwnwn', '%': 'nnnwnwnwn', '*': 'nwnnwnwnn'
   };
 
-  let rows: Row[] = [];
-  let loaded = false;
+  function sanitizeData(val: string | number) {
+    const s = String(val ?? '').toUpperCase().trim();
+    return [...s].filter((ch) => ALLOWED.includes(ch)).join('');
+  }
+  const withGuards = (s: string) => `*${s}*`;
 
-  // Adjustable columns (persisted)
-  let cols = 3;
-  const COLS_MIN = 1;
-  const COLS_MAX = 6;
+  // Build bar/space runs; includes quiet zones (10 narrow units each side)
+  function buildRuns(data: string): { isBar: boolean; units: number }[] {
+    const runs: { isBar: boolean; units: number }[] = [];
+    const push = (isBar: boolean, units: number) => {
+      if (units <= 0) return;
+      const last = runs[runs.length - 1];
+      if (last && last.isBar === isBar) last.units += units;
+      else runs.push({ isBar, units });
+    };
 
-  // Keep refs to the grid and each barcode element for fitting
-  let gridEl: HTMLElement | null = null;
-  let barcodeEls: HTMLElement[] = [];
+    // quiet left
+    push(false, 10);
 
-  function toCode39(v: string | number) {
-    const s = String(v ?? '').trim();
-    return `*${s}*`;
+    const chars = [...data];
+    chars.forEach((ch, idx) => {
+      const pat = C39[ch];
+      if (!pat) return;
+      let isBar = true;
+      for (const token of pat) {
+        push(isBar, token === 'w' ? 3 : 1);
+        isBar = !isBar;
+      }
+      if (idx < chars.length - 1) push(false, 1); // inter-char gap
+    });
+
+    // quiet right
+    push(false, 10);
+    return runs;
   }
 
-  function handlePrint() { window.print(); }
+  // Render *all* barcodes into their hosts
+  function renderAll() {
+    if (mode !== 'svg' || !svgSupported) return;
+    const hosts = document.querySelectorAll<HTMLElement>('.barcode-host');
+    const cards = document.querySelectorAll<HTMLElement>('.label-card');
 
-  // Smart Back: if there's history, go back; otherwise go home
-  function handleBack() {
-    if (history.length > 1) history.back();
-    else goto('/');
+    rows.forEach((r, i) => {
+      renderIntoHost(r.article, hosts[i] || null, cards[i] || null);
+    });
   }
 
-  function persistCols() {
-    try { localStorage.setItem('label_cols', String(cols)); } catch {}
-  }
+  // Render one into a host <div>
+  function renderIntoHost(article: string, host: HTMLElement | null, card: HTMLElement | null) {
+    if (!host) return;
 
-  function onColsInput(e: Event) {
-    const v = Number((e.target as HTMLInputElement).value || cols);
-    cols = Math.max(COLS_MIN, Math.min(COLS_MAX, v));
-    persistCols();
-    refitSoon();
-  }
-  function nudgeCols(delta: number) {
-    cols = Math.max(COLS_MIN, Math.min(COLS_MAX, cols + delta));
-    persistCols();
-    refitSoon();
-  }
+    // container sizing
+    const container = card ?? host;
+    const pad = 8;
+    const width = Math.max(120, (container.clientWidth || 240) - pad * 2);
+    const height = Math.max(44, Math.round(width * 0.18)); // ~4:1
 
-  // Register barcode nodes for fitting
-  function registerBarcode(node: HTMLElement) {
-    barcodeEls.push(node);
-    refitSoon();
-    return { destroy() { barcodeEls = barcodeEls.filter((n) => n !== node); } };
-  }
+    const dataText = sanitizeData(article);
+    const data = withGuards(dataText);
+    const runs = buildRuns(data);
 
-  // Fit routine
-  const BASE_SIZE = 56;
-  const MAX_SIZE = 80;
-  const MIN_SIZE = 18;
-  const SIDE_PADDING_PX = 2;
+    const totalUnits = runs.reduce((a, r) => a + r.units, 0);
+    const modulePx = Math.max(0.7, Math.floor(width / totalUnits));
+    const barcodeW = Math.max(1, Math.round(modulePx * totalUnits));
 
-  function fitOne(el: HTMLElement) {
-    const box = el.parentElement as HTMLElement | null;
-    if (!box) return;
-    const available = box.clientWidth - SIDE_PADDING_PX;
-    if (available <= 0) return;
+    // clear host
+    host.innerHTML = '';
 
-    el.style.fontSize = BASE_SIZE + 'px';
-    const measured = el.scrollWidth || el.getBoundingClientRect().width || 0;
-    if (measured <= 0) return;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', String(barcodeW));
+    svg.setAttribute('height', String(height));
+    svg.setAttribute('viewBox', `0 0 ${barcodeW} ${height}`);
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    svg.classList.add('text-black', 'dark:text-white');
 
-    let newSize = (BASE_SIZE * available) / measured;
-    if (newSize > MAX_SIZE) newSize = MAX_SIZE;
-    if (newSize < MIN_SIZE) newSize = MIN_SIZE;
-    el.style.fontSize = newSize + 'px';
-  }
-
-  let refitTimer: ReturnType<typeof setTimeout> | null = null;
-  function refitSoon() {
-    if (refitTimer) clearTimeout(refitTimer);
-    refitTimer = setTimeout(() => { for (const el of barcodeEls) fitOne(el); }, 0);
-  }
-
-  let ro: ResizeObserver | null = null;
-  function setupObservers() {
-    if (gridEl && 'ResizeObserver' in window) {
-      ro = new ResizeObserver(() => refitSoon());
-      ro.observe(gridEl);
+    let x = 0;
+    for (const r of runs) {
+      const wpx = r.units * modulePx;
+      if (r.isBar) {
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', String(x));
+        rect.setAttribute('y', '0');
+        rect.setAttribute('width', String(wpx));
+        rect.setAttribute('height', String(height));
+        rect.setAttribute('fill', 'currentColor');
+        svg.appendChild(rect);
+      }
+      x += wpx;
     }
-    window.addEventListener('resize', refitSoon);
-    window.addEventListener('orientationchange', refitSoon);
-    window.addEventListener('beforeprint', () => { for (const el of barcodeEls) fitOne(el); });
-  }
-  function teardownObservers() {
-    ro?.disconnect(); ro = null;
-    window.removeEventListener('resize', refitSoon);
-    window.removeEventListener('orientationchange', refitSoon);
+    host.appendChild(svg);
   }
 
-  onMount(async () => {
-    // Prefer sessionStorage (same-tab), fallback to localStorage (new-tab)
-    try {
-      const rawSession = sessionStorage.getItem('mpl_rows_v1');
-      const rawLocal = localStorage.getItem('mpl_rows_v1');
-      rows = rawSession ? (JSON.parse(rawSession) as Row[]) : (rawLocal ? (JSON.parse(rawLocal) as Row[]) : []);
-    } catch { rows = []; }
-
-    try {
-      const savedCols = Number(localStorage.getItem('label_cols') || cols);
-      if (!Number.isNaN(savedCols)) cols = Math.max(COLS_MIN, Math.min(COLS_MAX, savedCols));
-    } catch {}
-
-    loaded = true;
-    setupObservers();
-    await tick();
-    refitSoon();
-  });
+  // helpers
+  const human = (v: string | number) => String(v ?? '').trim();
 </script>
 
 <svelte:head>
   <link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+39&display=swap" rel="stylesheet" />
   <style>
-    :root {
-      --label-gap: 6mm;
-      --label-pad: 4mm;
+    /* Toolbar select arrow (cross-browser) */
+    .toolbar {
+      --arrow: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23334155' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
     }
+    .toolbar select {
+      -webkit-appearance: none;
+      appearance: none;
+      background-image: var(--arrow);
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      background-size: 12px;
+      padding-right: 32px;
+      min-height: 36px;
+      line-height: 1.2;
+      border-radius: 10px;
+    }
+    .toolbar label { display:inline-flex; align-items:center; min-height:36px; font-size:14px; }
+
+    /* Font fallback look */
     .barcode39 {
       font-family: 'Libre Barcode 39', cursive;
       line-height: 1;
       letter-spacing: 0;
       white-space: nowrap;
-      color: currentColor;
-      /* font-size set dynamically */
+      font-size: 46px;
     }
-    .barcode-box { width: 100%; overflow: visible; }
 
+    /* Print tweaks */
     @media print {
-      @page { size: A4; margin: 10mm; }
-      body { background: white !important; color: black !important; }
-      .no-print { display: none !important; }
-      .label { break-inside: avoid; }
-      .barcode39 { color: black !important; }
+      header, .controls { display: none !important; }
+      .page { padding: 0; }
+      .grid { gap: 8px; }
+      .label-card { box-shadow: none; border-color: #000; }
     }
   </style>
 </svelte:head>
 
 <div class="min-h-screen bg-gradient-to-b from-white to-slate-50 text-slate-900 dark:from-slate-950 dark:to-slate-900 dark:text-slate-100 transition-colors">
-  <!-- Top bar -->
-  <div class="no-print sticky top-0 z-20 border-b border-slate-200/60 bg-white/75 dark:bg-slate-950/70 backdrop-blur-md">
-    <div class="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <button on:click={handleBack} class="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm hover:bg-slate-50 dark:hover:bg-slate-800">← Back</button>
-        <div class="text-lg font-semibold tracking-tight">Labels</div>
-      </div>
-      <div class="flex items-center gap-3">
-        <div class="flex items-center gap-2">
-          <span class="text-sm">Columns</span>
-          <button class="rounded-md border px-2 py-1 text-sm hover:bg-slate-50 dark:hover:bg-slate-800" on:click={() => nudgeCols(-1)} aria-label="Decrease columns">−</button>
-          <input type="range" min={COLS_MIN} max={COLS_MAX} step="1" value={cols} on:input={onColsInput} class="w-32" aria-label="Columns slider" />
-          <button class="rounded-md border px-2 py-1 text-sm hover:bg-slate-50 dark:hover:bg-slate-800" on:click={() => nudgeCols(+1)} aria-label="Increase columns">＋</button>
-          <span class="w-6 text-center text-sm tabular-nums">{cols}</span>
-        </div>
-        <button on:click={handlePrint} class="rounded-lg bg-sky-600 text-white px-4 py-2 text-sm hover:opacity-90 disabled:opacity-50" disabled={!rows.length} aria-label="Print labels">Print</button>
+  <!-- Header / controls -->
+  <header class="sticky top-0 z-30 border-b border-slate-200/60 bg-white/70 dark:bg-slate-950/60 backdrop-blur-md">
+    <div class="toolbar mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
+      <button type="button" on:click={smartBack}
+        class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-2">
+        ← Back
+      </button>
+
+      <div class="controls flex items-center gap-4">
+        <label class="text-sm text-slate-700 dark:text-slate-300">Renderer:</label>
+        <select bind:value={mode}
+          class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm">
+          <option value="svg">SVG (recommended)</option>
+          <option value="font">Font fallback</option>
+        </select>
+
+        <label class="text-sm text-slate-700 dark:text-slate-300">Columns:</label>
+        <select bind:value={columns}
+          on:change={(e) => (columns = +(e.currentTarget as HTMLSelectElement).value)}
+          class="rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+        </select>
       </div>
     </div>
-  </div>
+  </header>
 
-  <section class="mx-auto max-w-6xl px-4 py-6">
-    {#if loaded && rows.length === 0}
-      <div class="no-print mt-6 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 p-4 text-slate-700 dark:text-slate-300">
-        No rows found. Go back and click <span class="font-semibold">Print labels</span> after extracting.
+  <section class="page mx-auto max-w-6xl px-4 py-6">
+    {#if error}
+      <div class="rounded-xl border border-rose-200 dark:border-rose-900 bg-rose-50 dark:bg-rose-950 p-3 text-rose-800 dark:text-rose-200">
+        {error}
       </div>
     {:else}
-      <div bind:this={gridEl} class="grid" style={`grid-template-columns: repeat(${cols}, 1fr); gap: var(--label-gap);`}>
-        {#each rows as r (r.article)}
-          <div class="label border rounded-xl p-[var(--label-pad)] bg-white dark:bg-slate-900 shadow-sm">
-            <div class="barcode-box">
-              <div class="barcode39 text-black dark:text-white" use:registerBarcode>{toCode39(r.article)}</div>
-            </div>
-            <div class="mt-1 text-xs opacity-70 tabular-nums">{r.article}</div>
-            {#if r.description}
-              <div class="mt-2 text-sm font-medium leading-snug">{r.description}</div>
+      <div
+        class="grid"
+        style={`display:grid; grid-template-columns: repeat(${columns}, minmax(0, 1fr)); gap: 12px;`}
+      >
+        {#each rows as r, i}
+          <div class="label-card rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-3 shadow-sm flex flex-col justify-between">
+            <!-- Description -->
+            <div class="text-[13px] leading-tight font-medium truncate">{r.description}</div>
+
+            <!-- Barcode -->
+            {#if mode === 'svg' && svgSupported}
+              <div class="mt-1 flex justify-center">
+                <div class="barcode-host text-black dark:text-white" data-i={i} />
+              </div>
+            {:else}
+              <div class="mt-1 text-center">
+                <div class="barcode39 text-black dark:text-white">
+                  {'*' + human(r.article) + '*'}
+                </div>
+              </div>
             {/if}
-            <div class="mt-2 text-xs grid grid-cols-2 gap-2 opacity-70">
-              {#if r.soh !== undefined}<div>SOH: <span class="font-semibold">{r.soh}</span></div>{/if}
-              {#if r.mpl !== undefined}<div>MPL: <span class="font-semibold">{r.mpl}</span></div>{/if}
+
+            <!-- Human-readable + SOH/MPL -->
+            <div class="mt-2 text-center">
+              <div class="text-sm font-semibold tracking-wide">{human(r.article)}</div>
+              <div class="text-[12px] text-slate-600 dark:text-slate-300 mt-0.5">
+                SOH: <span class="tabular-nums">{r.soh}</span>
+                &nbsp;|&nbsp;
+                MPL: <span class="tabular-nums">{r.mpl}</span>
+              </div>
             </div>
           </div>
         {/each}

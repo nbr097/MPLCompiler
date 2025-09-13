@@ -64,10 +64,32 @@
     ]);
   }
 
-  // Guarded Code 39 string: wrap in asterisks
+  // ----- Code 39 helpers -----
+  const CODE39_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%';
+  const CODE39_VALUES: Record<string, number> = (() => {
+    const map: Record<string, number> = {};
+    for (let i = 0; i < CODE39_ALPHABET.length; i++) map[CODE39_ALPHABET[i]] = i;
+    return map;
+  })();
+
+  // Clean to valid Code39 (uppercase + allowed chars). Returns only digits/letters if others present.
+  function sanitizeForCode39(input: string | number) {
+    const s = String(input ?? '').toUpperCase();
+    const out = [...s].filter((ch) => CODE39_VALUES[ch] !== undefined);
+    return out.join('');
+  }
+  function code39Checksum(data: string) {
+    // Mod-43 checksum (optional). Some scanners may expect it.
+    const sum = [...data].reduce((acc, ch) => acc + (CODE39_VALUES[ch] ?? 0), 0);
+    const idx = sum % 43;
+    return CODE39_ALPHABET[idx];
+  }
+  // Guarded Code 39 string: wrap in asterisks; optionally include checksum before the closing '*'
+  const USE_CODE39_CHECKSUM = false; // set true if your scanners expect a checksum
   function toCode39(value: string | number) {
-    const s = String(value ?? '').trim();
-    return `*${s}*`;
+    const body = sanitizeForCode39(value);
+    const payload = USE_CODE39_CHECKSUM ? body + code39Checksum(body) : body;
+    return `*${payload}*`;
   }
 
   // Persist rows/meta to storage (both local & session for flexibility)
@@ -291,13 +313,39 @@
   <!-- Libre Barcode 39 font for Code 39 barcodes -->
   <link href="https://fonts.googleapis.com/css2?family=Libre+Barcode+39&display=swap" rel="stylesheet" />
   <style>
+    /* Always render scannable: black on white, quiet zones, no scaling */
+    .barcode-wrap {
+      display: inline-block;
+      background: #fff;        /* keep light background even in dark mode */
+      padding: 0 12px;         /* quiet zone on screen */
+      white-space: nowrap;
+      border: 1px solid transparent; /* prevents some printers from clipping edges */
+    }
     .barcode39 {
       font-family: 'Libre Barcode 39', cursive;
+      font-weight: 400;        /* never bold */
+      color: #000 !important;  /* dark bars */
       line-height: 1;
       letter-spacing: 0;
-      /* Size tuned for table; labels page can render larger */
-      font-size: 42px;
+      font-size: 42px;         /* table size; labels page can render larger */
       white-space: nowrap;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    @media (prefers-color-scheme: dark) {
+      .barcode-wrap { background: #fff; } /* override dark backgrounds */
+    }
+    @media print {
+      .barcode-wrap {
+        background: #fff !important;
+        padding-left: 0.20in;   /* recommended Code39 quiet zone ≈ 10× narrow bar */
+        padding-right: 0.20in;
+      }
+      .barcode39 {
+        color: #000 !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
     }
   </style>
 </svelte:head>
@@ -352,7 +400,9 @@
         <div class="md:col-span-3">
           <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/70 p-6 shadow-sm">
             <h1 class="text-2xl font-bold tracking-tight">Upload your report</h1>
-            <p class="mt-1 text-slate-600 dark:text-slate-400">Drop a PDF anywhere, or choose a file. We’ll extract rows where <span class="font-semibold">SOH ≤ MPL</span>.</p>
+            <p class="mt-1 text-slate-600 dark:text-slate-400">
+              Drop a PDF anywhere, or choose a file. We’ll extract rows where <span class="font-semibold">SOH ≤ MPL</span>.
+            </p>
 
             <div class="mt-5 space-y-5">
 
@@ -469,7 +519,9 @@
                   <tr class="border-t border-slate-200 dark:border-slate-800 align-top">
                     <td class="px-4 py-2 tabular-nums">
                       <div class="font-medium">{r.article}</div>
-                      <div class="barcode39 text-black dark:text-white mt-1">{toCode39(r.article)}</div>
+                      <div class="barcode-wrap mt-1">
+                        <span class="barcode39">{toCode39(r.article)}</span>
+                      </div>
                     </td>
                     <td class="px-4 py-2">{r.description}</td>
                     <td class="px-4 py-2 tabular-nums">{r.soh}</td>
